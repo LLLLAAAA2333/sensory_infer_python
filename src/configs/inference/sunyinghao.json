@@ -1,0 +1,29 @@
+{
+  "line": "Wen1165",
+  "name": "CBMI",
+  "version": "1.0",
+  "zrange": [0, 25],
+
+  "ext_path": "/home/cbmi/CBMI_python/models/releases/20230715/treeformer_ext.pt",
+  "det_path": "/home/cbmi/CBMI_python/models/releases/20230730/treeformer_det_512.pt",
+  "rec_path": "/home/cbmi/CBMI_python/models/releases/20230730/treeformer_rec_2023_10_05_20_55_43_93428_4deploy_fp16.pt",
+
+  "ext_input_dim": [1, 1024, 1024],
+  "det_input_dim": [1, 1024, 1024],
+  "rec_input_dim": [1, 250, 8],
+
+  "ext_conf": 0.01,
+
+  "det_conf": 0.20,
+  "det_iou_t": 0.20,
+  "region_shrink_pixel": 2,
+
+  "rec_pt_mode": "p",
+  "xoy_unit": 0.3,
+  "z_unit": 2,
+  "unit": "um/pixel",
+
+
+  "is_ext": false,
+  "magnification":40
+}

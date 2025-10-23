@@ -1,0 +1,31 @@
+{
+  "name": "CBMI",
+  "version": "1.0",
+  "zrange": [1, 17],
+
+  "ext_path": "/home/cbmi/CBMI_python/models/releases/20230715/treeformer_ext.pt",
+  "det_path": "/home/cbmi/CBMI_python/models/releases/20230730/treeformer_det_512.pt",
+  "rec_path": "/home/cbmi/CBMI_python/models/releases/20230730/treeformer_rec_2023_12_31_01_19_10_70074_4deploy_fp16.pt",
+
+  "ext_input_dim": [1, 1024, 1024],
+  "det_input_dim": [1, 512, 512],
+  "rec_input_dim": [1, 180, 8],
+
+  "ext_conf": 0.15,
+
+  "det_conf": 0.80,
+  "det_iou_t": 0.30,
+  "region_shrink_pixel": 2,
+
+  "rec_pt_mode": "psi",
+  "xoy_unit": 0.3,
+  "z_unit": 1.5,
+  "unit": "um/pixel",
+
+
+  "is_ext": true,
+  "magnification":40,
+
+  "det_keep_ratio": 0.90,
+  "ext_keep_ratio": 0.90
+}
