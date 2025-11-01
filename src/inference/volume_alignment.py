@@ -3,9 +3,13 @@ import sys
 import torch
 import numpy as np
 import tqdm
+import cv2
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 from src.inference.blur import pixel_threshold, get_image4processing
+from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
 
+
+# ----------------------------- Old methods for volume alignment(Exhaustive) ----------------------------- #
 def pixel2binary(image, rate=0.98):
     index = round(torch.numel(image) * rate)
     threshold = torch.mean(torch.sort(image.view(-1))[0][index:].float())
@@ -105,3 +109,27 @@ def volume_alignment(file_list, save_path, shiftrange=(51, 51)):
     np.save(os.path.join(save_path, 'shift_list.npy'), shift_list)
     
     return aligned_volumes_mip, shift_list
+
+# ----------------------------- volume alignment(Phase Correlation) ----------------------------- #
+def translation_matching_phase_corr(volume1_gpu, volume2_gpu, device='cuda'):
+    """
+    Compute the translation offset between volume1 and volume2 using phase correlation
+    return the proper row shift and column shift
+    """
+    binary_volume1 = pixel_threshold(volume1_gpu.permute(2, 0, 1).unsqueeze(1)).squeeze(1).permute(1, 2, 0)
+    binary_volume2 = pixel_threshold(volume2_gpu.permute(2, 0, 1).unsqueeze(1)).squeeze(1).permute(1, 2, 0)
+
+    binary_image1 = get_image4processing(binary_volume1).to(torch.int) # (Y, X)
+    binary_image2 = get_image4processing(binary_volume2).to(torch.int) # (Y, X)
+
+    img1_np = binary_image1.cpu().numpy().astype(np.float32)
+    img2_np = binary_image2.cpu().numpy().astype(np.float32)
+
+    if img1_np.shape != img2_np.shape:
+        print_warning_message(f"MIP shape mismatch {img1_np.shape} vs {img2_np.shape}. Skipping alignment.")
+        return (0, 0), -1.0
+    
+    shift_xy, response = cv2.phaseCorrelate(img1_np, img2_np)
+    shift_x, shift_y = shift_xy
+    shift_yx = (shift_y, shift_x)
+    return shift_yx, -response

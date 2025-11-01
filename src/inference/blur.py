@@ -37,7 +37,14 @@ def gaussian_blur(volume, kernel_size: int = 5):
     return F.conv2d(volume, torch.tensor(g_kernel, dtype = volume.dtype, device = volume.device), padding = kernel_size // 2)
 
 def pixel_threshold(volume, gaussian_k: int = 9, maxpool_k: int = 125, bg_t_r: float = 1.2, rescale_p: float = .97, only_scale: bool = False):
-    volume_torch =  volume.to(torch.float32).permute(2, 0, 1).unsqueeze(1)
+    if isinstance(volume, np.ndarray):
+        volume = torch.from_numpy(volume)
+    volume_torch = volume.to(torch.float32)
+
+    if volume_torch.dim() == 3:
+        volume_torch =  volume.to(torch.float32).permute(2, 0, 1).unsqueeze(1)
+    elif volume_torch.dim() == 4:
+        pass
     if gaussian_k > 1:  
         volume_torch[:] = gaussian_blur(volume_torch, kernel_size = gaussian_k)
     threshold = calc_volume_bg_threshold(volume_torch, kernel_and_stride = maxpool_k, t_ratio = bg_t_r)
