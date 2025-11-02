@@ -224,7 +224,7 @@ def calculate_intensity_conv_torch(volume, bbox, threshold, background_threshold
     
     return max_average_intensity - background_threshold, best_slices
 
-def extract_neuron_intensities_torch(volume, neuron_pt_tuple, intensity_threshold=130, background_threshold=102, device='cuda'):
+def extract_neuron_intensities_torch(volume, neuron_pt_tuple, intensity_threshold=110, background_threshold=102, device='cuda'):
     """
     Args:
         volume (np.ndarray): 3D volume data (Y, X, Z).
