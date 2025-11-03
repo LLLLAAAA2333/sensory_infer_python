@@ -236,7 +236,13 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             ex_vol_data = np.load(ex_file_path)
 
-            intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(ex_vol_data, valid_interp_tuple, intensity_threshold=120, background_threshold=102, device=device)
+            intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
+                ex_vol_data,
+                valid_interp_tuple,
+                area_ratio=0.8,
+                background_threshold=0,
+                device=device,
+            )
             if isinstance(intensity_values, torch.Tensor):
                 intensity_values = intensity_values.detach().cpu().numpy()
             if isinstance(intensity_indices, torch.Tensor):
