@@ -10,8 +10,8 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 from src.comm_utils.prints import print_log_message, print_warning_message, pad_num
 from src.merge_resize_inference import Treeformer_End2End, VolumeMemoryBuffer, draw_volume_result
 
-def run_inference_on_single_volume(volume_path, config_path, output_dir, **args):
-    print_log_message(f"Running inference on volume: {volume_path}")
+def run_inference_on_single_volume(volume_np, config_path, output_dir, **args):
+    
     os.makedirs(output_dir, exist_ok=True)
     neuron_output_path = os.path.join(output_dir, "neuron_pt_tuple.npy")
     vis_output_path_base = os.path.join(output_dir, "inference_result")
@@ -55,7 +55,6 @@ def run_inference_on_single_volume(volume_path, config_path, output_dir, **args)
     print_log_message("Model initialized.")
 
     print_log_message("Loading volume data...")
-    volume_np = np.load(volume_path)
     volume_tensor = torch.HalfTensor(volume_np.transpose(2, 0, 1)[:, np.newaxis, :, :].astype(np.float32)).cuda()
     print_log_message("Volume data loaded, shape: " + str(volume_tensor.shape))
 
@@ -119,6 +118,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args_dict = vars(args)
+    volume_path = args_dict['volume_path']
+    volume_np = np.load(volume_path)
+    print_log_message(f"Running inference on volume: {volume_path}")
     run_inference_on_single_volume(
+        volume_np,
         **args_dict
     )
