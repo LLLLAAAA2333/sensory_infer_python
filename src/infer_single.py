@@ -103,7 +103,7 @@ def run_inference_on_single_volume(volume_np, config_path, output_dir, **args):
         )
 
     print_log_message("Inference completed.")
-
+    return neuron_pt_tuple_to_save
 if __name__ == "__main__":
     import argparse
 
