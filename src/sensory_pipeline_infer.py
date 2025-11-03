@@ -311,6 +311,7 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
     """
     with open(config_path, "r") as f:
         config = json.load(f)
+    device = kwargs.get('device', 'cuda')
     
     # get experiment volume paths
     ex_vol_paths = []
@@ -528,7 +529,7 @@ if __name__ == '__main__':
             pre_resize=args.pre_resize,
             pre_resize_size=args.pre_resize_size,
             pre_rescale_pixels=args.pre_rescale_pixels,
-            align_shiftrange=shiftrange
+            shiftrange=shiftrange
         )
         print_info_message("MIP mode processing finished.")
         
