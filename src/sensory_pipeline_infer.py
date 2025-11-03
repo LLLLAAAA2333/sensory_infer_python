@@ -9,13 +9,16 @@ import h5py
 from glob import glob
 from tqdm import tqdm
 import torch
+from torch.nn import functional as F
 import vis_trajectory as vis
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 
 from src.infer_sequence import run_inference_on_volume_sequence
-from src.inference.volume_alignment import compute_distance
+from src.infer_single import run_inference_on_single_volume
+from src.inference.volume_alignment import compute_distance, volume_alignment
 from src.inference.blur import get_image4processing, pixel_threshold
 from src.inference.intensity_extract import extract_neuron_intensities_torch
+from src.merge_resize_inference import Treeformer_End2End
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
 
 def load_datapath(folder_path):
@@ -298,6 +301,101 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     
     return ex_neuron_pt_tuple, all_intensities_df
 
+def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwargs):
+    """
+    Args:
+        ex_vol_folders: list of folders, each containing experimental .npy volumes
+        config_path: path to model configuration JSON file
+        output_dir: directory to save outputs
+        kwargs: additional arguments for interpolate_and_extract
+    """
+    with open(config_path, "r") as f:
+        config = json.load(f)
+    
+    # get experiment volume paths
+    ex_vol_paths = []
+    for folder in ex_vol_folders:
+        ex_vol_paths.append(load_datapath(folder))
+    
+    if not ex_vol_paths:
+        print_warning_message("No .npy files found in any experimental volume folders. Stopping MIP mode.")
+        return
+    
+    print_log_message(f"Found {len(ex_vol_paths)} total experimental volumes for MIP processing.")
+    
+    synthetic_volume_save_path = os.path.join(output_dir, "synthetic_mip_results")
+    os.makedirs(synthetic_volume_save_path, exist_ok=True)
+
+    shiftrange = kwargs.get('shiftrange', (101, 101))
+    print_log_message("Running volume alignment to create artificial MIP...")
+    aligned_volumes_mip, shift_list = volume_alignment(
+        ex_vol_paths, 
+        synthetic_volume_save_path, 
+        shiftrange=shiftrange
+    )
+    np.save(os.path.join(synthetic_volume_save_path, 'aligned_volumes_mip.npy'), aligned_volumes_mip)
+    np.save(os.path.join(synthetic_volume_save_path, 'shift_list.npy'), shift_list)
+    print_log_message(f"Artificial MIP and shift list saved to {synthetic_volume_save_path}")
+
+    print_log_message("Running inference on artificial MIP...")
+    neuron_pt_tuple_np = run_inference_on_single_volume(aligned_volumes_mip, config_path, synthetic_volume_save_path, **kwargs)
+    print_log_message("Inference on artificial MIP completed.")
+
+    print_log_message("Extracting 3D intensities from all experimental volumes using shifts...")
+    num_neurons = neuron_pt_tuple_np.shape[0]
+    all_intensities_list = []
+    ex_neuron_pt_tuple_list = []
+
+    for index, file_path in enumerate(tqdm(ex_vol_paths, desc="Extracting 3D Intensities")):
+        current_coords = neuron_pt_tuple_np.copy()
+        if index > 0:
+            # shift_list[index-1] corresponds to volume[index] vs volume[0]
+            shift = shift_list[index - 1] 
+            row_shift = -shift[1] # Y shift (inverse)
+            col_shift = -shift[0] # X shift (inverse)
+            current_coords[:, 0] += col_shift # X coord
+            current_coords[:, 1] += row_shift # Y coord
+        ex_neuron_pt_tuple_list.append(current_coords)
+
+        ex_vol_data = np.load(file_path)
+        intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
+            ex_vol_data,
+            current_coords,
+            area_ratio=0.8,
+            background_threshold=0,
+            device=device,
+        )
+
+        vol_intensity = pd.Series(np.nan, index=range(num_neurons))
+        if intensity_values.size > 0:
+            vol_intensity.iloc[intensity_indices] = intensity_values
+
+        all_intensities_list.append(vol_intensity)
+    
+    all_intensities_df = pd.concat(all_intensities_list, axis=1)
+    all_intensities_df.columns = range(len(ex_vol_paths))
+
+    output_csv_path = os.path.join(output_dir, "neuron_intensities_extracted.csv")
+    all_intensities_df.to_csv(output_csv_path, index_label="neuron_index")
+    match = re.search(r'w(\d+)', output_dir)
+    if match:
+        prefix = match.group(0)  
+        file_name = prefix + '_trace.h5'
+        file_path = os.path.join(output_dir, file_name)
+    else:
+        file_path = os.path.join(output_dir, 'trace.h5')
+    
+    with h5py.File(file_path, 'w') as h5f:
+        h5f.create_dataset('intensity', data=all_intensities_df.values)
+    print_log_message(f"Saved extracted intensities to {output_csv_path} and {file_path}.")
+
+    ex_neuron_pt_tuple = np.stack(ex_neuron_pt_tuple_list, axis=0)
+    ex_coords_path = os.path.join(output_dir, "ex_neuron_pt_tuple.npy")
+    np.save(ex_coords_path, ex_neuron_pt_tuple)
+    print_log_message(f"Saved aligned experimental coords for video to {ex_coords_path}")
+
+    return ex_neuron_pt_tuple, all_intensities_df, ex_vol_paths
+
 def generate_experiment_volume_video(
     ex_volumes,
     ex_neuron_pt_tuple,
@@ -391,7 +489,7 @@ if __name__ == '__main__':
     parser.add_argument("--pre-resize", type=int, default=1, choices=[0, 1], help="Whether to pre-resize the reference volumes (1: yes, 0: no).")
     parser.add_argument("--pre-resize-size", type=int, default=680, help="Size for pre-resizing the largest dimension of reference volumes.")
     parser.add_argument("--pre-rescale-pixels", type=int, default=1, choices=[0, 1], help="Whether to pre-rescale pixels of reference volumes (1: yes, 0: no).")
-    parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate'], 
+    parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate', 'mip'], 
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
                         help="Local search range (Rows,Cols) for 'align' or 'dual_propagate' mode, e.g., '21,21' for +/- 10 pixels.")
@@ -411,33 +509,7 @@ if __name__ == '__main__':
     else:
         print_info_message('CUDA is not available. Using CPU')
         device = 'cpu'
-    
-    print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
-    run_inference_on_volume_sequence(
-        volume_dir=args.ref_volumes_dir,
-        config_path=args.config,
-        output_dir=ref_inference_output_dir,
-        json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
-        pre_resize=args.pre_resize,
-        pre_resize_size=args.pre_resize_size,
-        pre_rescale_pixels=args.pre_rescale_pixels
-    )
-    print_log_message("Phase 1: Reference inference complete.")
 
-    print_info_message(f"--- Phase 2: Starting {args.processing_mode} and intensity extraction ---")
-    # load reference coordinates
-    ref_coords_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple_filled.npy")
-    if not os.path.exists(ref_coords_path):
-        ref_coords_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple.npy")
-        if not os.path.exists(ref_coords_path):
-            raise FileNotFoundError("Could not find 'ref_neuron_pt_tuple_filled.npy' or 'ref_neuron_pt_tuple.npy'. Phase 1 may have failed.")
-        else:
-            print_warning_message("Using non-interpolated reference coordinates ('ref_neuron_pt_tuple.npy').")
-
-    ref_coords = np.load(ref_coords_path)
-    ex_vol_folders = sorted(glob(os.path.join(args.ex_volumes_root, "ImgStk*")))
-    ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
-    
     try:
         shiftrange = tuple(map(int, args.align_shiftrange.split(',')))
         if len(shiftrange) != 2: raise ValueError
@@ -445,33 +517,74 @@ if __name__ == '__main__':
         print_warning_message(f"Invalid shiftrange '{args.align_shiftrange}'. Using default (21,21).")
         shiftrange = (21, 21)
 
-    ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
-                                                    ref_coords, 
-                                                    ex_vol_folders, 
-                                                    ref_vol_paths,
-                                                    args.output_dir, 
-                                                    mode=args.processing_mode,
-                                                    device=device,
-                                                    shiftrange=shiftrange
-                                                )
-    print_info_message("Processing finished.")
-
-    print_info_message("--- Phase 3: Generating experimental volume video ---")
-
-    if ex_neuron_pt_tuple is not None:
-        ex_volume_path_list = []
-        for folder in ex_vol_folders:
-            ex_volume_path_list.extend(load_datapath(folder))
-        if ex_volume_path_list:
-            video_output_dir = os.path.join(args.output_dir, "experiment_volume_video")
-            generate_experiment_volume_video(
-                ex_volume_path_list,
-                ex_neuron_pt_tuple,
-                video_output_dir,
-                fps=5,
-                z_ratio=5.0,
-            )
-        else:
-            print_warning_message("No experimental volumes found for video generation.")
+    ex_vol_folders = sorted(glob(os.path.join(args.ex_volumes_root, "ImgStk*")))
     
-    print_info_message("Video generation complete.")
+    if args.processing_mode == 'mip':
+        ex_neuron_pt_tuple, all_intensities_df, ex_volume_path_list = run_mip_inference_and_extract(
+            ex_vol_folders=ex_vol_folders,
+            config_path=args.config,
+            output_dir=args.output_dir,
+            device=device, 
+            pre_resize=args.pre_resize,
+            pre_resize_size=args.pre_resize_size,
+            pre_rescale_pixels=args.pre_rescale_pixels,
+            align_shiftrange=shiftrange
+        )
+        print_info_message("MIP mode processing finished.")
+        
+    else:
+        print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
+        run_inference_on_volume_sequence(
+            volume_dir=args.ref_volumes_dir,
+            config_path=args.config,
+            output_dir=ref_inference_output_dir,
+            json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
+            pre_resize=args.pre_resize,
+            pre_resize_size=args.pre_resize_size,
+            pre_rescale_pixels=args.pre_rescale_pixels
+        )
+        print_log_message("Phase 1: Reference inference complete.")
+
+        print_info_message(f"--- Phase 2: Starting {args.processing_mode} and intensity extraction ---")
+        # load reference coordinates
+        ref_coords_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple_filled.npy")
+        if not os.path.exists(ref_coords_path):
+            ref_coords_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple.npy")
+            if not os.path.exists(ref_coords_path):
+                raise FileNotFoundError("Could not find 'ref_neuron_pt_tuple_filled.npy' or 'ref_neuron_pt_tuple.npy'. Phase 1 may have failed.")
+            else:
+                print_warning_message("Using non-interpolated reference coordinates ('ref_neuron_pt_tuple.npy').")
+
+        ref_coords = np.load(ref_coords_path)
+        ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
+
+        ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
+                                                        ref_coords, 
+                                                        ex_vol_folders, 
+                                                        ref_vol_paths,
+                                                        args.output_dir, 
+                                                        mode=args.processing_mode,
+                                                        device=device,
+                                                        shiftrange=shiftrange
+                                                    )
+        print_info_message("Processing finished.")
+
+        print_info_message("--- Phase 3: Generating experimental volume video ---")
+
+        if ex_neuron_pt_tuple is not None:
+            ex_volume_path_list = []
+            for folder in ex_vol_folders:
+                ex_volume_path_list.extend(load_datapath(folder))
+            if ex_volume_path_list:
+                video_output_dir = os.path.join(args.output_dir, "experiment_volume_video")
+                generate_experiment_volume_video(
+                    ex_volume_path_list,
+                    ex_neuron_pt_tuple,
+                    video_output_dir,
+                    fps=5,
+                    z_ratio=5.0,
+                )
+            else:
+                print_warning_message("No experimental volumes found for video generation.")
+        
+        print_info_message("Video generation complete.")
