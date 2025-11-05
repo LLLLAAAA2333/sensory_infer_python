@@ -352,10 +352,10 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
         if index > 0:
             # shift_list[index-1] corresponds to volume[index] vs volume[0]
             shift = shift_list[index - 1] 
-            row_shift = -shift[1] # Y shift (inverse)
-            col_shift = -shift[0] # X shift (inverse)
-            current_coords[:, 0] += col_shift # X coord
-            current_coords[:, 1] += row_shift # Y coord
+            row_shift = -shift[1]
+            col_shift = -shift[0]
+            current_coords[:, 0] += row_shift
+            current_coords[:, 1] += col_shift
         ex_neuron_pt_tuple_list.append(current_coords)
 
         ex_vol_data = np.load(file_path)
