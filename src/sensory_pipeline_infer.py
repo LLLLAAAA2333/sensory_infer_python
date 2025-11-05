@@ -316,7 +316,7 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
     # get experiment volume paths
     ex_vol_paths = []
     for folder in ex_vol_folders:
-        ex_vol_paths.append(load_datapath(folder))
+        ex_vol_paths.extend(load_datapath(folder))
     
     if not ex_vol_paths:
         print_warning_message("No .npy files found in any experimental volume folders. Stopping MIP mode.")
@@ -480,7 +480,7 @@ if __name__ == '__main__':
     
     # input arguments
     parser.add_argument('--ex-volumes-root', type=str, required=True, help="Root directory containing subfolders of experimental .npy volumes.")
-    parser.add_argument('--ref-volumes-dir', type=str, required=True, help="Directory containing the sequence of reference .npy volumes.")
+    parser.add_argument('--ref-volumes-dir', type=str, required=False, help="Directory containing the sequence of reference .npy volumes.")
     parser.add_argument('--config', type=str, required=True, default = "/home/wenlab-user/JinghaoWang/new_new/code_v1.10/src/configs/inference/240623.json",help="Path to the model configuration JSON file.")
     
     # output arguments
@@ -500,9 +500,8 @@ if __name__ == '__main__':
         config = json.load(f)
 
     # config path
-    ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(ref_inference_output_dir, exist_ok=True)
+
 
     if torch.cuda.is_available():
         print_info_message(f'Using GPU: {torch.cuda.get_device_name(torch.cuda.current_device())}')
@@ -535,6 +534,9 @@ if __name__ == '__main__':
         
     else:
         print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
+        ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
+        os.makedirs(ref_inference_output_dir, exist_ok=True)
+
         run_inference_on_volume_sequence(
             volume_dir=args.ref_volumes_dir,
             config_path=args.config,
@@ -570,22 +572,22 @@ if __name__ == '__main__':
                                                     )
         print_info_message("Processing finished.")
 
-        print_info_message("--- Phase 3: Generating experimental volume video ---")
+    print_info_message("--- Phase 3: Generating experimental volume video ---")
 
-        if ex_neuron_pt_tuple is not None:
-            ex_volume_path_list = []
-            for folder in ex_vol_folders:
-                ex_volume_path_list.extend(load_datapath(folder))
-            if ex_volume_path_list:
-                video_output_dir = os.path.join(args.output_dir, "experiment_volume_video")
-                generate_experiment_volume_video(
-                    ex_volume_path_list,
-                    ex_neuron_pt_tuple,
-                    video_output_dir,
-                    fps=5,
-                    z_ratio=5.0,
-                )
-            else:
-                print_warning_message("No experimental volumes found for video generation.")
-        
-        print_info_message("Video generation complete.")
+    if ex_neuron_pt_tuple is not None:
+        ex_volume_path_list = []
+        for folder in ex_vol_folders:
+            ex_volume_path_list.extend(load_datapath(folder))
+        if ex_volume_path_list:
+            video_output_dir = os.path.join(args.output_dir, "experiment_volume_video")
+            generate_experiment_volume_video(
+                ex_volume_path_list,
+                ex_neuron_pt_tuple,
+                video_output_dir,
+                fps=5,
+                z_ratio=5.0,
+            )
+        else:
+            print_warning_message("No experimental volumes found for video generation.")
+    
+    print_info_message("Video generation complete.")
