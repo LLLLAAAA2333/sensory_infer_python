@@ -2,7 +2,7 @@ import os
 import sys
 import torch
 import numpy as np
-import tqdm
+from tqdm import tqdm
 import cv2
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 from src.inference.blur import pixel_threshold, get_image4processing
