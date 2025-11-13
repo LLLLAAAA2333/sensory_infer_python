@@ -13,40 +13,67 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 from src.comm_utils.prints import print_log_message, print_warning_message, pad_num
 from src.merge_resize_inference import Treeformer_End2End, VolumeMemoryBuffer, draw_volume_result
 
-def _find_neighbor(neuron_pt_tuple, t_miss, n_miss, K=5):
-        # mask nan values
-        nan_mask = np.isnan(neuron_pt_tuple[:, :, [0,1,2]]).any(axis=2)
-        nan_indices = np.argwhere(nan_mask)
 
-        missing_counts = nan_mask.sum(axis=0)
-        stable_neurons = np.where(missing_counts == 0)[0]
+def _apply_zrange(volume_np, zrange=None):
+    if zrange is None:
+        return volume_np
+    z_start, z_end = zrange
+    z_start = max(z_start, 0)
+    if z_end == -1 or z_end > volume_np.shape[2]:
+        z_end = volume_np.shape[2]
+    if z_start == 0 and z_end == volume_np.shape[2]:
+        return volume_np
+    return volume_np[:, :, z_start:z_end]
 
-        valid_t_indices = np.where(nan_mask[:, n_miss] == False)[0]
-        distances_to_t_miss = np.abs(valid_t_indices - t_miss)
-        t_ref = valid_t_indices[np.argmin(distances_to_t_miss)]
+def _find_neighbor(neuron_pt_tuple, t_miss, n_miss, K=5, max_K=20, step=5):
+    """Find stable neighbors for a missing neuron using incremental K search."""
+    nan_mask = np.isnan(neuron_pt_tuple[:, :, [0, 1, 2]]).any(axis=2)
 
-        # build kdtree
-        coords_ref = neuron_pt_tuple[t_ref, :, 0:3]
-        target_coord_ref = coords_ref[n_miss]
-        # clean up nan values in coords_ref
-        valid_mask_ref = ~np.isnan(coords_ref).any(axis=1)
-        coords_ref_clean = coords_ref[valid_mask_ref]
-        original_indices_mapping = np.where(valid_mask_ref)[0]
-        kdtree = KDTree(coords_ref_clean)
-        distances, clean_indices = kdtree.query(target_coord_ref, k=K+1)
+    valid_t_indices = np.where(~nan_mask[:, n_miss])[0]
+    if valid_t_indices.size == 0:
+        return np.array([], dtype=np.int64), None
+
+    distances_to_t_miss = np.abs(valid_t_indices - t_miss)
+    t_ref = valid_t_indices[np.argmin(distances_to_t_miss)]
+
+    coords_ref = neuron_pt_tuple[t_ref, :, 0:3]
+    target_coord_ref = coords_ref[n_miss]
+    valid_mask_ref = ~np.isnan(coords_ref).any(axis=1)
+    coords_ref_clean = coords_ref[valid_mask_ref]
+    if coords_ref_clean.size == 0:
+        return np.array([], dtype=np.int64), t_ref
+
+    original_indices_mapping = np.where(valid_mask_ref)[0]
+    kdtree = KDTree(coords_ref_clean)
+
+    max_K = max(K, max_K)
+    for cur_k in range(K, max_K + 1, step):
+        query_k = min(cur_k + 1, coords_ref_clean.shape[0])
+        distances, clean_indices = kdtree.query(target_coord_ref, k=query_k)
+        clean_indices = np.atleast_1d(clean_indices)
         original_neighbor_indices = original_indices_mapping[clean_indices]
 
+        if original_neighbor_indices.size == 0:
+            continue
+
+        # remove the neuron itself
         if original_neighbor_indices[0] == n_miss:
-                potential_neighbor_indices = original_neighbor_indices[1:]
-                potential_distances = distances[1:]
+            potential_neighbor_indices = original_neighbor_indices[1:]
+        else:
+            potential_neighbor_indices = original_neighbor_indices
 
-                is_present_at_t_miss = (nan_mask[t_miss, potential_neighbor_indices] == False)
-                stable_neighbor_indices = potential_neighbor_indices[is_present_at_t_miss]
-                if len(stable_neighbor_indices) == 0 and K < 20:
-                        print_log_message(f"No stable neighbors found for neuron {n_miss} at time {t_miss} with K={K}")
-                        stable_neighbor_indices = _find_neighbor(neuron_pt_tuple, t_miss, n_miss, K=K+5)
+        if potential_neighbor_indices.size == 0:
+            print_log_message(f"No stable neighbors found for neuron {n_miss} at time {t_miss} with K={cur_k}")
+            continue
 
-        return stable_neighbor_indices, t_ref
+        is_present_at_t_miss = ~nan_mask[t_miss, potential_neighbor_indices]
+        stable_neighbor_indices = potential_neighbor_indices[is_present_at_t_miss]
+        if stable_neighbor_indices.size > 0:
+            return stable_neighbor_indices.astype(np.int64), t_ref
+
+        print_log_message(f"No stable neighbors found for neuron {n_miss} at time {t_miss} with K={cur_k}")
+
+    return np.array([], dtype=np.int64), t_ref
 
 def _interpolate_features(neuron_pt_tuple, t_miss, n_miss, t_ref, stable_neighbor_indices):
 
@@ -73,12 +100,18 @@ def interpolate_missing_neurons(neuron_pt_tuple, K=5):
     fail_count = 0
     for t_miss, n_miss in nan_indices:
         stable_neighbor_indices, t_ref = _find_neighbor(neuron_pt_tuple, t_miss, n_miss, K=K)
-        if len(stable_neighbor_indices) > 0:
+        if stable_neighbor_indices.size > 0 and t_ref is not None:
             estimated_full_tuple = _interpolate_features(neuron_pt_tuple, t_miss, n_miss, t_ref, stable_neighbor_indices)
             neuron_pt_tuple_filled[t_miss, n_miss, :] = estimated_full_tuple
             fill_count += 1
         else:
-            fail_count += 1
+            available_times = np.where(~np.isnan(neuron_pt_tuple[:, n_miss, 0]))[0]
+            if available_times.size > 0:
+                nearest_time = available_times[np.argmin(np.abs(available_times - t_miss))]
+                neuron_pt_tuple_filled[t_miss, n_miss, :] = neuron_pt_tuple_filled[nearest_time, n_miss, :]
+                fill_count += 1
+            else:
+                fail_count += 1
     
     print_log_message(f"Filled {fill_count} missing neurons, failed to fill {fail_count} missing neurons.")
     return neuron_pt_tuple_filled
@@ -93,16 +126,36 @@ def run_inference_on_volume_sequence(volume_dir, config_path, output_dir, **kwar
     print_log_message(f"Loading configuration from {config_path}")
     with open(config_path, 'r') as f:
         config = json.load(f)
-    
+
+    def _natural_key(path):
+        return [int(text) if text.isdigit() else text.lower()
+                for text in re.split(r'(\d+)', os.path.basename(path))]
+    volume_paths = sorted(glob.glob(os.path.join(volume_dir, "*.npy")),
+                      key=_natural_key)
+    if not volume_paths:
+        raise FileNotFoundError(f"No .npy volumes found in {volume_dir}")
+
+    zrange = kwargs.get('zrange') or config.get("zrange", [0, -1])
+    zrange = list(zrange)
+    z_start, z_end = zrange
+    sample_volume = np.load(volume_paths[0])
+    if z_end == -1 or z_end > sample_volume.shape[2]:
+        z_end = sample_volume.shape[2]
+    z_len = max(z_end - max(z_start, 0), 0)
+    if z_len <= 0:
+        raise ValueError(f"Invalid zrange {zrange} for volume depth {sample_volume.shape[2]}")
+    del sample_volume
+
     print_log_message("Initializing model...")
+
     model = Treeformer_End2End(
 
         ext_path = config["ext_path"],
         det_path = config["det_path"],
         rec_path = config["rec_path"],
 
-        ext_input_dim = [config["zrange"][1] - config["zrange"][0]] + config["ext_input_dim"],
-        det_input_dim = [config["zrange"][1] - config["zrange"][0]] + config["det_input_dim"],
+        ext_input_dim = [z_len] + config["ext_input_dim"],
+        det_input_dim = [z_len] + config["det_input_dim"],
         rec_input_dim = config["rec_input_dim"],
 
         ext_conf = config["ext_conf"],
@@ -127,12 +180,6 @@ def run_inference_on_volume_sequence(volume_dir, config_path, output_dir, **kwar
         warmup_num_vol = 10,
     )
     print_log_message("Model initialized.")
-    def _natural_key(path):
-        return [int(text) if text.isdigit() else text.lower()
-                for text in re.split(r'(\d+)', os.path.basename(path))]
-    volume_paths = sorted(glob.glob(os.path.join(volume_dir, "*.npy")),
-                      key=_natural_key)
-    args_zrange = config.get("zrange", [0, -1])
     all_results = {}
     temporal_results = []
     for idx, volume_path in enumerate(volume_paths):
@@ -142,10 +189,7 @@ def run_inference_on_volume_sequence(volume_dir, config_path, output_dir, **kwar
         current_neuron_pt_tuples = []
         current_neuron_pred_ids = []
         volume_np = np.load(volume_path)
-        current_zrange = args_zrange
-        if args_zrange[1] == -1:
-            current_zrange[1] = volume_np.shape[2]
-            volume_np = volume_np[:, :, current_zrange[0]:current_zrange[1]]
+        volume_np = _apply_zrange(volume_np, (z_start, z_end))
         volume_tensor = torch.HalfTensor(volume_np.transpose(2, 0, 1)[:, np.newaxis, :, :].astype(np.float32)).cuda()
 
         pre_resize = kwargs.get('pre_resize', 1)
