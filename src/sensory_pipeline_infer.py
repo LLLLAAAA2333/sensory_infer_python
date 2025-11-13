@@ -21,6 +21,19 @@ from src.inference.intensity_extract import extract_neuron_intensities_torch
 from src.merge_resize_inference import Treeformer_End2End
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
 
+
+def apply_zrange(volume_np, zrange=None):
+    """Slice volume along Z axis using the provided [start, end) range."""
+    if zrange is None:
+        return volume_np
+    z_start, z_end = zrange
+    z_start = max(z_start, 0)
+    if z_end == -1 or z_end > volume_np.shape[2]:
+        z_end = volume_np.shape[2]
+    if z_start == 0 and z_end == volume_np.shape[2]:
+        return volume_np
+    return volume_np[:, :, z_start:z_end]
+
 def load_datapath(folder_path):
     """
     Load several .npy files from several folders
@@ -58,16 +71,17 @@ def translation_matching_bruteforce_with_dist(volume1_gpu, volume2_gpu, shiftran
     shift_yx = (min_distance_index[0] - shiftrange[0] // 2, min_distance_index[1] - shiftrange[1] // 2)
     return shift_yx, min_distance.item()
 
-def load_ex_vol_gpu(path, cache, device='cuda'):
+def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
     if path not in cache:
         vol_data = np.load(path)
+        vol_data = apply_zrange(vol_data, zrange)
         if vol_data.dtype == np.uint16:
             vol_data = vol_data.astype(np.float32)
         cache[path] = torch.from_numpy(vol_data).to(device).float()
     return cache[path]
 
 def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_dir,
-                            mode='interpolate', device='cuda', shiftrange=(21, 21)):
+                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None):
     """
     Args:
         ref_coords: numpy array of shape (T_ref, N_neurons, F_features)
@@ -93,6 +107,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
         if idx not in ref_vols_gpu_cache:
             try:
                 vol_data = np.load(ref_vol_paths[idx])
+                vol_data = apply_zrange(vol_data, zrange)
                 if vol_data.dtype == np.uint16:
                     vol_data = vol_data.astype(np.float32)
                 ref_vols_gpu_cache[idx] = torch.from_numpy(vol_data).to(device).float()
@@ -101,17 +116,24 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 return None
         return ref_vols_gpu_cache[idx]
     
+    ex_folder_files = [load_datapath(folder) for folder in ex_vol_folders]
+    ex_seg_counts = np.array([len(files) for files in ex_folder_files], dtype=np.int32)
+
     all_intensities_df = pd.DataFrame(index=range(N_neurons))
     global_frame_counter = 0
     ex_tuples = []
 
-    for t in tqdm(range(min(T_ref - 1, len(ex_vol_folders))), desc="Extracting intensities"):
+    num_segments = min(T_ref - 1, len(ex_vol_folders))
+    total_volumes = sum(len(ex_folder_files[idx]) for idx in range(num_segments))
+    volume_progress = tqdm(total=total_volumes, desc="Processing volumes", unit="vol") if total_volumes else None
+
+    for t in range(num_segments):
         ref_start_coords = ref_coords[t]
         ref_end_coords = ref_coords[t + 1]
 
         current_mode = mode
 
-        ex_files = load_datapath(ex_vol_folders[t])
+        ex_files = ex_folder_files[t]
         num_ex_vols = len(ex_files)
         if num_ex_vols == 0:
             print_warning_message(f"No .npy files found in {ex_vol_folders[t]}. Skipping this folder.")
@@ -129,7 +151,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             print_log_message(f"Running dual propagation for segment {t} ({num_ex_vols} frames)...")
 
             print_log_message(f"  Aligning ref_A to ex_vol_0...")
-            vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device)
+            vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device, zrange=zrange)
             shift_yx, dist = translation_matching_bruteforce_with_dist(ref_A_vol_gpu, vol_k_minus_1_gpu, shiftrange, device)
             current_f_coords = ref_start_coords.copy()
             shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_f_coords.dtype)
@@ -139,7 +161,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             forward_coords[0] = current_f_coords.copy()
 
             for k in range(1, num_ex_vols):
-                vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device)
+                vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
                 shift_yx, dist = translation_matching_bruteforce_with_dist(vol_k_minus_1_gpu, vol_k_gpu, shiftrange, device)
                 shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_f_coords.dtype)
                 current_f_coords[:, :3] -= shift_vector
@@ -149,7 +171,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             del vol_k_gpu, vol_k_minus_1_gpu
 
             print_log_message(f"  Aligning ref_B to ex_vol_{num_ex_vols - 1}...")
-            vol_k_plus_1_gpu = load_ex_vol_gpu(ex_files[-1], {}, device)
+            vol_k_plus_1_gpu = load_ex_vol_gpu(ex_files[-1], {}, device, zrange=zrange)
             shift_yx, dist = translation_matching_bruteforce_with_dist(ref_B_vol_gpu, vol_k_plus_1_gpu, shiftrange, device)
 
             current_b_coords = ref_end_coords.copy()
@@ -159,7 +181,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             backward_coords[-1] = current_b_coords.copy()
 
             for k in range(num_ex_vols - 2, -1, -1):
-                vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device)
+                vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
                 shift_yx, dist = translation_matching_bruteforce_with_dist(vol_k_plus_1_gpu, vol_k_gpu, shiftrange, device)
                 shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_b_coords.dtype)
                 current_b_coords[:, :3] -= shift_vector
@@ -187,7 +209,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 segment_coords[k] = blended_coords
 
 
-        for k, ex_file_path in enumerate(tqdm(ex_files, desc=f"processing folder {t}", leave=False)):
+        for k, ex_file_path in enumerate(ex_files):
             interp_pt_tuple = None
 
             if current_mode == 'interpolate':
@@ -199,25 +221,50 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             elif current_mode == 'align':
                 ex_vol_k_data = np.load(ex_file_path)
+                ex_vol_k_data = apply_zrange(ex_vol_k_data, zrange)
                 if ex_vol_k_data.dtype == np.uint16:
                     ex_vol_k_data = ex_vol_k_data.astype(np.float32)
                 ex_vol_k_gpu = torch.from_numpy(ex_vol_k_data).to(device).float()
                 
-                # phase correlation to get shift
+                # align with ref volumes
                 shift_A, dist_A = translation_matching_bruteforce_with_dist(ref_A_vol_gpu, ex_vol_k_gpu, shiftrange, device)
                 shift_B, dist_B = translation_matching_bruteforce_with_dist(ref_B_vol_gpu, ex_vol_k_gpu, shiftrange, device)
+                coords_A = ref_start_coords.copy()
+                coords_B = ref_end_coords.copy()
 
-                if dist_A <= dist_B:
-                    base_coords = ref_start_coords
-                    shift = shift_A
+                shift_vec_A = np.array([shift_A[1], shift_A[0], 0], dtype=coords_A.dtype)
+                coords_A[:, :3] -= shift_vec_A
+
+                shift_vec_B = np.array([shift_B[1], shift_B[0], 0], dtype=coords_B.dtype)
+                coords_B[:, :3] -= shift_vec_B
+
+                dists = np.array([dist_A, dist_B], dtype=np.float64)
+                finite_mask = np.isfinite(dists)
+                if not finite_mask.any():
+                    interp_pt_tuple = coords_A
                 else:
-                    base_coords = ref_end_coords
-                    shift = shift_B
+                    adjusted = np.zeros_like(dists)
+                    min_dist = np.nanmin(dists[finite_mask])
+                    adjusted[finite_mask] = np.exp(-(dists[finite_mask] - min_dist))
+                    weight_sum = np.sum(adjusted)
 
-                interp_pt_tuple = base_coords.copy()
-                shift_vector = np.array([shift[1], shift[0]], dtype=interp_pt_tuple.dtype)
-                interp_pt_tuple[:, 0] -= shift_vector[0]  # X
-                interp_pt_tuple[:, 1] -= shift_vector[1]  # Y
+                    if weight_sum <= 0.0:
+                        interp_pt_tuple = coords_A if dist_A <= dist_B else coords_B
+                    else:
+                        ratio_A = adjusted[0] / weight_sum
+                        ratio_B = adjusted[1] / weight_sum
+                        interp_pt_tuple = np.full_like(coords_A, np.nan)
+                        valid_A = ~np.isnan(coords_A[:, 0])
+                        valid_B = ~np.isnan(coords_B[:, 0])
+                        both_valid = valid_A & valid_B
+                        if both_valid.any():
+                            interp_pt_tuple[both_valid] = ratio_A * coords_A[both_valid] + ratio_B * coords_B[both_valid]
+                        only_A = valid_A & ~valid_B
+                        if only_A.any():
+                            interp_pt_tuple[only_A] = coords_A[only_A]
+                        only_B = ~valid_A & valid_B
+                        if only_B.any():
+                            interp_pt_tuple[only_B] = coords_B[only_B]
 
             elif current_mode == 'dual_propagate':
                 interp_pt_tuple = segment_coords[k]
@@ -238,6 +285,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             valid_interp_tuple = interp_pt_tuple[final_valid_mask]
 
             ex_vol_data = np.load(ex_file_path)
+            ex_vol_data = apply_zrange(ex_vol_data, zrange)
 
             intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
                 ex_vol_data,
@@ -272,6 +320,13 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             vol_intensity.iloc[original_indices] = intensity_values
             all_intensities_df[global_frame_counter] = vol_intensity
             global_frame_counter += 1
+
+            if volume_progress is not None:
+                volume_progress.set_postfix({"segment": f"{t+1}/{num_segments}", "frame": f"{k+1}/{num_ex_vols}"}, refresh=False)
+                volume_progress.update(1)
+
+    if volume_progress is not None:
+        volume_progress.close()
         
     # save as CSV
     output_csv_path = os.path.join(output_dir, "neuron_intensities_extracted.csv")
@@ -287,6 +342,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     
     with h5py.File(file_path, 'w') as h5f:
         h5f.create_dataset('intensity', data=all_intensities_df.values)
+        h5f.create_dataset('n_seg', data=ex_seg_counts.astype(np.int64))
     print_log_message(f"Saved extracted intensities to {output_csv_path} and {file_path}.")
 
     # save all interpolated experimental coords (exclude ref)
@@ -301,7 +357,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     
     return ex_neuron_pt_tuple, all_intensities_df
 
-def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwargs):
+def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, zrange=None, **kwargs):
     """
     Args:
         ex_vol_folders: list of folders, each containing experimental .npy volumes
@@ -314,9 +370,12 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
     device = kwargs.get('device', 'cuda')
     
     # get experiment volume paths
+    ex_folder_files = [load_datapath(folder) for folder in ex_vol_folders]
+    ex_seg_counts = np.array([len(files) for files in ex_folder_files], dtype=np.int32)
+
     ex_vol_paths = []
-    for folder in ex_vol_folders:
-        ex_vol_paths.extend(load_datapath(folder))
+    for files in ex_folder_files:
+        ex_vol_paths.extend(files)
     
     if not ex_vol_paths:
         print_warning_message("No .npy files found in any experimental volume folders. Stopping MIP mode.")
@@ -332,7 +391,8 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
     aligned_volumes_mip, shift_list = volume_alignment(
         ex_vol_paths, 
         synthetic_volume_save_path, 
-        shiftrange=shiftrange
+        shiftrange=shiftrange,
+        zrange=zrange,
     )
     np.save(os.path.join(synthetic_volume_save_path, 'aligned_volumes_mip.npy'), aligned_volumes_mip)
     np.save(os.path.join(synthetic_volume_save_path, 'shift_list.npy'), shift_list)
@@ -359,6 +419,7 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
         ex_neuron_pt_tuple_list.append(current_coords)
 
         ex_vol_data = np.load(file_path)
+        ex_vol_data = apply_zrange(ex_vol_data, zrange)
         intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
             ex_vol_data,
             current_coords,
@@ -388,6 +449,7 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, **kwa
     
     with h5py.File(file_path, 'w') as h5f:
         h5f.create_dataset('intensity', data=all_intensities_df.values)
+        h5f.create_dataset('n_seg', data=ex_seg_counts.astype(np.int64))
     print_log_message(f"Saved extracted intensities to {output_csv_path} and {file_path}.")
 
     ex_neuron_pt_tuple = np.stack(ex_neuron_pt_tuple_list, axis=0)
@@ -407,6 +469,7 @@ def generate_experiment_volume_video(
     source_max=200,
     default_bbox_size=(6.0, 6.0, 6.0),
     red_pseudo_color=False,
+    zrange=None,
 ):
     """
     Render a volume video with neuron overlays from experimental volumes.
@@ -425,7 +488,8 @@ def generate_experiment_volume_video(
         ex_volume_paths = list(ex_volumes)
         total_frames = len(ex_volume_paths)
         def load_frame(idx):
-            return np.load(ex_volume_paths[idx])
+            volume = np.load(ex_volume_paths[idx])
+            return apply_zrange(volume, zrange)
 
     ex_neuron_pt_tuple = np.asarray(ex_neuron_pt_tuple)
     if ex_neuron_pt_tuple.shape[0] != total_frames:
@@ -502,6 +566,8 @@ if __name__ == '__main__':
     # config path
     os.makedirs(args.output_dir, exist_ok=True)
 
+    config_zrange = config.get('zrange')
+
 
     if torch.cuda.is_available():
         print_info_message(f'Using GPU: {torch.cuda.get_device_name(torch.cuda.current_device())}')
@@ -524,6 +590,7 @@ if __name__ == '__main__':
             ex_vol_folders=ex_vol_folders,
             config_path=args.config,
             output_dir=args.output_dir,
+            zrange=config_zrange,
             device=device, 
             pre_resize=args.pre_resize,
             pre_resize_size=args.pre_resize_size,
@@ -542,6 +609,7 @@ if __name__ == '__main__':
             config_path=args.config,
             output_dir=ref_inference_output_dir,
             json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
+            zrange=config_zrange,
             pre_resize=args.pre_resize,
             pre_resize_size=args.pre_resize_size,
             pre_rescale_pixels=args.pre_rescale_pixels
@@ -568,7 +636,8 @@ if __name__ == '__main__':
                                                         args.output_dir, 
                                                         mode=args.processing_mode,
                                                         device=device,
-                                                        shiftrange=shiftrange
+                                                        shiftrange=shiftrange,
+                                                        zrange=config_zrange,
                                                     )
         print_info_message("Processing finished.")
 
@@ -586,6 +655,7 @@ if __name__ == '__main__':
                 video_output_dir,
                 fps=5,
                 z_ratio=5.0,
+                zrange=config_zrange,
             )
         else:
             print_warning_message("No experimental volumes found for video generation.")
