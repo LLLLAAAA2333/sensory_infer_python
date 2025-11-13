@@ -4,6 +4,8 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 
+from src.loop_base import automatic_foreground_process
+
 def get_image4processing(volume, is_max=True):
     """
     Extracts an image from a volume by applying max or mean along the last dimension.
@@ -39,17 +41,32 @@ def gaussian_blur(volume, kernel_size: int = 5):
 def pixel_threshold(volume, gaussian_k: int = 9, maxpool_k: int = 125, bg_t_r: float = 1.2, rescale_p: float = .97, only_scale: bool = False):
     if isinstance(volume, np.ndarray):
         volume = torch.from_numpy(volume)
+
     volume_torch = volume.to(torch.float32)
 
     if volume_torch.dim() == 3:
-        volume_torch =  volume.to(torch.float32).permute(2, 0, 1).unsqueeze(1)
+        volume_4d = volume_torch.permute(2, 0, 1).unsqueeze(1).contiguous()
+        transpose_back = lambda tensor: tensor.squeeze(1).permute(1, 2, 0)
     elif volume_torch.dim() == 4:
-        pass
-    if gaussian_k > 1:  
-        volume_torch[:] = gaussian_blur(volume_torch, kernel_size = gaussian_k)
-    threshold = calc_volume_bg_threshold(volume_torch, kernel_and_stride = maxpool_k, t_ratio = bg_t_r)
-    mask = volume_torch > threshold
-    return mask.squeeze(1).permute(1, 2, 0)
+        volume_4d = volume_torch.contiguous()
+        transpose_back = lambda tensor: tensor.squeeze(1)
+    else:
+        raise ValueError(f"Unsupported volume dimension {volume_torch.dim()} for pixel_threshold")
+
+    processed = automatic_foreground_process(
+        volume_4d.clone(),
+        gaussian_k = gaussian_k,
+        maxpool_k = maxpool_k,
+        bg_t_r = bg_t_r,
+        rescale_p = rescale_p,
+        only_scale = only_scale,
+    )
+
+    if only_scale:
+        return transpose_back(processed)
+
+    mask = processed > 0
+    return transpose_back(mask)
 
 
 
