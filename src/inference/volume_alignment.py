@@ -73,33 +73,47 @@ def translate_matrix(image, row_shift, col_shift):
     
     return shifted_image
 
-def volume_alignment(file_list, save_path, shiftrange=(51, 51)):
+def _apply_zrange(volume_np, zrange=None):
+    if zrange is None:
+        return volume_np
+    z_start, z_end = zrange
+    z_start = max(z_start, 0)
+    if z_end == -1 or z_end > volume_np.shape[2]:
+        z_end = volume_np.shape[2]
+    if z_start == 0 and z_end == volume_np.shape[2]:
+        return volume_np
+    return volume_np[:, :, z_start:z_end]
+
+
+def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None):
     """
     Align volumes, return the synthetic volume and shift pixels of each volume comparing to the initial volume
     """
-    reference_volume = np.load(file_list[0]).astype(np.int32)
+    reference_volume = np.load(file_list[0])
+    reference_volume = _apply_zrange(reference_volume, zrange).astype(np.int32)
     reference_image = get_image4processing(torch.from_numpy(reference_volume).cuda())
     shift_list = []
-    n = len(file_list) // 100 + 1  # Extract several volumes to combine as synthetic volume
+    n = len(file_list) // 20 + 1  # Extract several volumes to combine as synthetic volume
     aligned_volumes = np.zeros((n, reference_volume.shape[0], reference_volume.shape[1], reference_volume.shape[2]))
 
     for index, file_path in enumerate(tqdm(file_list[1:], desc="Processing Volumes", leave=False)):
-        volume = np.load(file_path).astype(np.int32)
+        volume = np.load(file_path)
+        volume = _apply_zrange(volume, zrange).astype(np.int32)
         volume = torch.from_numpy(volume).cuda()
         # image = get_image4processing(volume)
 
         shift = translation_matching(torch.from_numpy(reference_volume).cuda(), volume, shiftrange)
         shift_list.append(shift)
         
-        if index % 100 == 0:
+        if index % 20 == 0:
             if shift != (0, 0):
                 aligned_volume = volume.clone()
                 for z in range(volume.shape[-1]):
                     aligned_volume[:, :, z] = translate_matrix(volume[:, :, z], shift[0], shift[1])
-                aligned_volumes[index // 100] = aligned_volume.cpu().numpy()
+                aligned_volumes[index // 20] = aligned_volume.cpu().numpy()
             else:
                 aligned_volume = volume.clone()
-                aligned_volumes[index // 100] = aligned_volume.cpu().numpy()
+                aligned_volumes[index // 20] = aligned_volume.cpu().numpy()
         
         # print(f"Processed Group {os.path.basename(file_path)[13:15]}, volume {os.path.basename(file_path)[-8:-4]}, time {end_time - start_time}")
 
