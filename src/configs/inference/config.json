@@ -14,8 +14,8 @@
 
     "ext_conf": 0.15,
 
-    "det_conf": 0.70,
-    "det_iou_t": 0.12,
+    "det_conf": 0.60,
+    "det_iou_t": 0.10,
     "region_shrink_pixel": 2,
 
     "rec_pt_mode": "psi",
@@ -29,8 +29,8 @@
 
     "mp": 0,
 
-    "det_keep_ratio": 0.80,
-    "rec_keep_ratio": 0.80
+    "det_keep_ratio": 0.8,
+    "rec_keep_ratio": 0.8
   
   }
   
