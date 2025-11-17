@@ -238,33 +238,37 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 shift_vec_B = np.array([shift_B[1], shift_B[0], 0], dtype=coords_B.dtype)
                 coords_B[:, :3] -= shift_vec_B
 
-                dists = np.array([dist_A, dist_B], dtype=np.float64)
-                finite_mask = np.isfinite(dists)
-                if not finite_mask.any():
-                    interp_pt_tuple = coords_A
-                else:
-                    adjusted = np.zeros_like(dists)
-                    min_dist = np.nanmin(dists[finite_mask])
-                    adjusted[finite_mask] = np.exp(-(dists[finite_mask] - min_dist))
-                    weight_sum = np.sum(adjusted)
+                # dists = np.array([dist_A, dist_B], dtype=np.float64)
+                # finite_mask = np.isfinite(dists)
+                # if not finite_mask.any():
+                #     interp_pt_tuple = coords_A
+                # else:
+                #     adjusted = np.zeros_like(dists)
+                #     min_dist = np.nanmin(dists[finite_mask])
+                #     adjusted[finite_mask] = np.exp(-(dists[finite_mask] - min_dist))
+                #     weight_sum = np.sum(adjusted)
 
-                    if weight_sum <= 0.0:
-                        interp_pt_tuple = coords_A if dist_A <= dist_B else coords_B
-                    else:
-                        ratio_A = adjusted[0] / weight_sum
-                        ratio_B = adjusted[1] / weight_sum
-                        interp_pt_tuple = np.full_like(coords_A, np.nan)
-                        valid_A = ~np.isnan(coords_A[:, 0])
-                        valid_B = ~np.isnan(coords_B[:, 0])
-                        both_valid = valid_A & valid_B
-                        if both_valid.any():
-                            interp_pt_tuple[both_valid] = ratio_A * coords_A[both_valid] + ratio_B * coords_B[both_valid]
-                        only_A = valid_A & ~valid_B
-                        if only_A.any():
-                            interp_pt_tuple[only_A] = coords_A[only_A]
-                        only_B = ~valid_A & valid_B
-                        if only_B.any():
-                            interp_pt_tuple[only_B] = coords_B[only_B]
+                #     if weight_sum <= 0.0:
+                #         interp_pt_tuple = coords_A if dist_A <= dist_B else coords_B
+                #     else:
+                #         ratio_A = adjusted[0] / weight_sum
+                #         ratio_B = adjusted[1] / weight_sum
+
+                ratio = k / (num_ex_vols - 1.0) if num_ex_vols > 1 else 0.5
+                interp_pt_tuple = np.full_like(coords_A, np.nan)
+                valid_A = ~np.isnan(coords_A[:, 0])
+                valid_B = ~np.isnan(coords_B[:, 0])
+                both_valid = valid_A & valid_B
+                if both_valid.any():
+                    interp_pt_tuple[both_valid] = (1.0 - ratio) * coords_A[both_valid] + ratio * coords_B[both_valid]
+                only_A = valid_A & ~valid_B
+                if only_A.any():
+                    interp_pt_tuple[only_A] = coords_A[only_A]
+                only_B = ~valid_A & valid_B
+                if only_B.any():
+                    interp_pt_tuple[only_B] = coords_B[only_B]
+                if np.isnan(interp_pt_tuple[:, 0]).all():
+                    interp_pt_tuple = coords_A if dist_A <= dist_B else coords_B
 
             elif current_mode == 'dual_propagate':
                 interp_pt_tuple = segment_coords[k]
@@ -463,9 +467,9 @@ def generate_experiment_volume_video(
     ex_volumes,
     ex_neuron_pt_tuple,
     save_dir,
-    fps=5,
+    fps=1,
     z_ratio=5.0,
-    source_min=130,
+    source_min=102,
     source_max=200,
     default_bbox_size=(6.0, 6.0, 6.0),
     red_pseudo_color=False,
@@ -554,6 +558,10 @@ if __name__ == '__main__':
     parser.add_argument("--pre-resize", type=int, default=1, choices=[0, 1], help="Whether to pre-resize the reference volumes (1: yes, 0: no).")
     parser.add_argument("--pre-resize-size", type=int, default=680, help="Size for pre-resizing the largest dimension of reference volumes.")
     parser.add_argument("--pre-rescale-pixels", type=int, default=1, choices=[0, 1], help="Whether to pre-rescale pixels of reference volumes (1: yes, 0: no).")
+    parser.add_argument('--skip-ref-inference', action='store_true',
+                        help="Skip reference sequence inference when precomputed coordinates are available.")
+    
+    # inference processing mode
     parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate', 'mip'], 
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
@@ -603,18 +611,20 @@ if __name__ == '__main__':
         print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
         ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
         os.makedirs(ref_inference_output_dir, exist_ok=True)
-
-        run_inference_on_volume_sequence(
-            volume_dir=args.ref_volumes_dir,
-            config_path=args.config,
-            output_dir=ref_inference_output_dir,
-            json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
-            zrange=config_zrange,
-            pre_resize=args.pre_resize,
-            pre_resize_size=args.pre_resize_size,
-            pre_rescale_pixels=args.pre_rescale_pixels
-        )
-        print_log_message("Phase 1: Reference inference complete.")
+        if args.skip_ref_inference:
+            print_info_message("Skipping reference inference; expecting existing ref_neuron_pt_tuple_filled.npy.")
+        else:
+            run_inference_on_volume_sequence(
+                volume_dir=args.ref_volumes_dir,
+                config_path=args.config,
+                output_dir=ref_inference_output_dir,
+                json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
+                zrange=config_zrange,
+                pre_resize=args.pre_resize,
+                pre_resize_size=args.pre_resize_size,
+                pre_rescale_pixels=args.pre_rescale_pixels
+            )
+            print_log_message("Phase 1: Reference inference complete.")
 
         print_info_message(f"--- Phase 2: Starting {args.processing_mode} and intensity extraction ---")
         # load reference coordinates
