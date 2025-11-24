@@ -20,6 +20,52 @@ from src.inference.blur import get_image4processing, pixel_threshold
 from src.inference.intensity_extract import extract_neuron_intensities_torch
 from src.merge_resize_inference import Treeformer_End2End
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
+from src import zephir_utils
+
+
+def _compute_z_ratio(config_dict):
+    xoy_unit = config_dict.get('xoy_unit')
+    z_unit = config_dict.get('z_unit')
+    if xoy_unit and z_unit:
+        try:
+            return float(z_unit) / float(xoy_unit)
+        except (ZeroDivisionError, TypeError, ValueError):
+            print_warning_message("Failed to compute z_ratio from config; falling back to default 5.0")
+    return 5.0
+
+
+def export_volumes_to_zephir(volume_source, neuron_pt_tuple_source, zephir_path, z_ratio, zrange, max_depth=20):
+    os.makedirs(zephir_path, exist_ok=True)
+    print_info_message(f"Converting inference outputs to ZephIR format at {zephir_path}...")
+    zephir_utils.convert_npy_to_ZephIR_format(
+        volume_source,
+        neuron_pt_tuple_source,
+        zephir_path,
+        zrange=zrange,
+        z_ratio=z_ratio,
+        max_depth=max_depth,
+    )
+    print_info_message(f"ZephIR data saved to {zephir_path}")
+
+
+def clamp_neuron_depth(array, depth_limit=20):
+    if array is None or depth_limit is None:
+        return array
+    if depth_limit <= 0:
+        raise ValueError("depth_limit must be positive")
+    if array.ndim < 2 or array.shape[-1] < 6:
+        return array
+    np.clip(array[..., 5], 0, depth_limit - 1, out=array[..., 5])
+    return array
+
+
+def clamp_neuron_depth_file(file_path, depth_limit=20):
+    if not file_path or not os.path.exists(file_path):
+        return None
+    data = np.load(file_path)
+    clamp_neuron_depth(data, depth_limit)
+    np.save(file_path, data)
+    return data
 
 
 def apply_zrange(volume_np, zrange=None):
@@ -361,7 +407,17 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     
     return ex_neuron_pt_tuple, all_intensities_df
 
-def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, zrange=None, **kwargs):
+def run_mip_inference_and_extract(
+    ex_vol_folders,
+    config_path,
+    output_dir,
+    zrange=None,
+    transfer_zephir_path=None,
+    skip_inference=False,
+    neuron_depth_limit=20,
+    zephir_z_ratio=5.0,
+    **kwargs,
+):
     """
     Args:
         ex_vol_folders: list of folders, each containing experimental .npy volumes
@@ -383,7 +439,7 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, zrang
     
     if not ex_vol_paths:
         print_warning_message("No .npy files found in any experimental volume folders. Stopping MIP mode.")
-        return
+        return None, None, []
     
     print_log_message(f"Found {len(ex_vol_paths)} total experimental volumes for MIP processing.")
     
@@ -391,20 +447,49 @@ def run_mip_inference_and_extract(ex_vol_folders, config_path, output_dir, zrang
     os.makedirs(synthetic_volume_save_path, exist_ok=True)
 
     shiftrange = kwargs.get('shiftrange', (101, 101))
-    print_log_message("Running volume alignment to create artificial MIP...")
-    aligned_volumes_mip, shift_list = volume_alignment(
-        ex_vol_paths, 
-        synthetic_volume_save_path, 
-        shiftrange=shiftrange,
-        zrange=zrange,
-    )
-    np.save(os.path.join(synthetic_volume_save_path, 'aligned_volumes_mip.npy'), aligned_volumes_mip)
-    np.save(os.path.join(synthetic_volume_save_path, 'shift_list.npy'), shift_list)
-    print_log_message(f"Artificial MIP and shift list saved to {synthetic_volume_save_path}")
+    aligned_path = os.path.join(synthetic_volume_save_path, 'aligned_volumes_mip.npy')
+    shift_path = os.path.join(synthetic_volume_save_path, 'shift_list.npy')
+    neuron_tuple_path = os.path.join(synthetic_volume_save_path, 'neuron_pt_tuple.npy')
 
-    print_log_message("Running inference on artificial MIP...")
-    neuron_pt_tuple_np = run_inference_on_single_volume(aligned_volumes_mip, config_path, synthetic_volume_save_path, **kwargs)
-    print_log_message("Inference on artificial MIP completed.")
+    if skip_inference:
+        if not os.path.exists(aligned_path) or not os.path.exists(neuron_tuple_path):
+            raise FileNotFoundError("Missing aligned_volumes_mip.npy or neuron_pt_tuple.npy in synthetic_mip_results. Cannot skip inference.")
+        aligned_volumes_mip = np.load(aligned_path)
+        neuron_pt_tuple_np = np.load(neuron_tuple_path)
+        shift_list = np.load(shift_path) if os.path.exists(shift_path) else None
+        print_log_message("Loaded precomputed MIP inference artifacts.")
+    else:
+        print_log_message("Running volume alignment to create artificial MIP...")
+        aligned_volumes_mip, shift_list = volume_alignment(
+            ex_vol_paths,
+            synthetic_volume_save_path,
+            shiftrange=shiftrange,
+            zrange=zrange,
+        )
+        np.save(aligned_path, aligned_volumes_mip)
+        np.save(shift_path, shift_list)
+        print_log_message(f"Artificial MIP and shift list saved to {synthetic_volume_save_path}")
+
+        print_log_message("Running inference on artificial MIP...")
+        neuron_pt_tuple_np = run_inference_on_single_volume(aligned_volumes_mip, config_path, synthetic_volume_save_path, **kwargs)
+        print_log_message("Inference on artificial MIP completed.")
+
+    clamp_neuron_depth(neuron_pt_tuple_np, neuron_depth_limit)
+    np.save(neuron_tuple_path, neuron_pt_tuple_np)
+
+    if transfer_zephir_path:
+        export_volumes_to_zephir(
+            aligned_volumes_mip,
+            neuron_pt_tuple_np,
+            transfer_zephir_path,
+            z_ratio=zephir_z_ratio,
+            zrange=None,
+            max_depth=neuron_depth_limit,
+        )
+        return None, None, ex_vol_paths
+
+    if shift_list is None:
+        raise FileNotFoundError("Shift list not found; cannot extract intensities in MIP mode.")
 
     print_log_message("Extracting 3D intensities from all experimental volumes using shifts...")
     num_neurons = neuron_pt_tuple_np.shape[0]
@@ -553,19 +638,24 @@ if __name__ == '__main__':
     
     # output arguments
     parser.add_argument('--output-dir', type=str, required=True, help="Directory to save all outputs, including reference inference and final intensity data.")
+    parser.add_argument('--transfer-zephir-path', type=str, default=None,
+                        help="If provided, skip intensity extraction and convert inference outputs into ZephIR format stored at this path.")
+    parser.add_argument('--neuron-depth-limit', type=int, default=20, help="Maximum neuron depth limit")
     
     # inference arguments
     parser.add_argument("--pre-resize", type=int, default=1, choices=[0, 1], help="Whether to pre-resize the reference volumes (1: yes, 0: no).")
     parser.add_argument("--pre-resize-size", type=int, default=680, help="Size for pre-resizing the largest dimension of reference volumes.")
     parser.add_argument("--pre-rescale-pixels", type=int, default=1, choices=[0, 1], help="Whether to pre-rescale pixels of reference volumes (1: yes, 0: no).")
-    parser.add_argument('--skip-ref-inference', action='store_true',
-                        help="Skip reference sequence inference when precomputed coordinates are available.")
+    parser.add_argument('--skip-inference', '--skip-ref-inference', dest='skip_inference', action='store_true',
+                        help="Skip running inference when precomputed results already exist (applies to all modes, including mip).")
     
     # inference processing mode
     parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate', 'mip'], 
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
                         help="Local search range (Rows,Cols) for 'align' or 'dual_propagate' mode, e.g., '21,21' for +/- 10 pixels.")
+
+    parser.set_defaults(skip_inference=False)
 
     args = parser.parse_args()
     with open(args.config, "r") as f:
@@ -575,6 +665,7 @@ if __name__ == '__main__':
     os.makedirs(args.output_dir, exist_ok=True)
 
     config_zrange = config.get('zrange')
+    config_zratio = _compute_z_ratio(config)
 
 
     if torch.cuda.is_available():
@@ -592,6 +683,8 @@ if __name__ == '__main__':
         shiftrange = (21, 21)
 
     ex_vol_folders = sorted(glob(os.path.join(args.ex_volumes_root, "ImgStk*")))
+    ex_neuron_pt_tuple = None
+    all_intensities_df = None
     
     if args.processing_mode == 'mip':
         ex_neuron_pt_tuple, all_intensities_df, ex_volume_path_list = run_mip_inference_and_extract(
@@ -599,7 +692,11 @@ if __name__ == '__main__':
             config_path=args.config,
             output_dir=args.output_dir,
             zrange=config_zrange,
-            device=device, 
+            transfer_zephir_path=args.transfer_zephir_path,
+            skip_inference=args.skip_inference,
+            neuron_depth_limit=args.neuron_depth_limit,
+            zephir_z_ratio=config_zratio,
+            device=device,
             pre_resize=args.pre_resize,
             pre_resize_size=args.pre_resize_size,
             pre_rescale_pixels=args.pre_rescale_pixels,
@@ -608,10 +705,13 @@ if __name__ == '__main__':
         print_info_message("MIP mode processing finished.")
         
     else:
+        if not args.ref_volumes_dir:
+            raise ValueError("'--ref-volumes-dir' is required for non-mip processing modes.")
+
         print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
         ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
         os.makedirs(ref_inference_output_dir, exist_ok=True)
-        if args.skip_ref_inference:
+        if args.skip_inference:
             print_info_message("Skipping reference inference; expecting existing ref_neuron_pt_tuple_filled.npy.")
         else:
             run_inference_on_volume_sequence(
@@ -626,30 +726,46 @@ if __name__ == '__main__':
             )
             print_log_message("Phase 1: Reference inference complete.")
 
+        filled_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple_filled.npy")
+        raw_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple.npy")
+        for candidate in (filled_path, raw_path):
+            clamp_neuron_depth_file(candidate, args.neuron_depth_limit)
+
         print_info_message(f"--- Phase 2: Starting {args.processing_mode} and intensity extraction ---")
-        # load reference coordinates
-        ref_coords_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple_filled.npy")
+        ref_coords_path = filled_path if os.path.exists(filled_path) else raw_path
         if not os.path.exists(ref_coords_path):
-            ref_coords_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple.npy")
-            if not os.path.exists(ref_coords_path):
-                raise FileNotFoundError("Could not find 'ref_neuron_pt_tuple_filled.npy' or 'ref_neuron_pt_tuple.npy'. Phase 1 may have failed.")
-            else:
-                print_warning_message("Using non-interpolated reference coordinates ('ref_neuron_pt_tuple.npy').")
+            raise FileNotFoundError("Could not find 'ref_neuron_pt_tuple_filled.npy' or 'ref_neuron_pt_tuple.npy'. Phase 1 may have failed.")
+        elif ref_coords_path == raw_path:
+            print_warning_message("Using non-interpolated reference coordinates ('ref_neuron_pt_tuple.npy').")
 
         ref_coords = np.load(ref_coords_path)
-        ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
+        clamp_neuron_depth(ref_coords, args.neuron_depth_limit)
 
-        ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
-                                                        ref_coords, 
-                                                        ex_vol_folders, 
-                                                        ref_vol_paths,
-                                                        args.output_dir, 
-                                                        mode=args.processing_mode,
-                                                        device=device,
-                                                        shiftrange=shiftrange,
-                                                        zrange=config_zrange,
-                                                    )
-        print_info_message("Processing finished.")
+        if args.transfer_zephir_path:
+            export_volumes_to_zephir(
+                args.ref_volumes_dir,
+                ref_coords_path,
+                args.transfer_zephir_path,
+                z_ratio=config_zratio,
+                zrange=config_zrange,
+                max_depth=args.neuron_depth_limit,
+            )
+            print_info_message("ZephIR conversion complete; skipping experimental intensity extraction.")
+            ex_neuron_pt_tuple = None
+            all_intensities_df = None
+        else:
+            ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
+            ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
+                ref_coords,
+                ex_vol_folders,
+                ref_vol_paths,
+                args.output_dir,
+                mode=args.processing_mode,
+                device=device,
+                shiftrange=shiftrange,
+                zrange=config_zrange,
+            )
+            print_info_message("Processing finished.")
 
     print_info_message("--- Phase 3: Generating experimental volume video ---")
 
