@@ -44,7 +44,7 @@ def rescale_image(image, target_min, target_max, source_min=None, source_max=Non
     return np.clip((image_float32 - source_min) / (source_max - source_min) * (target_max - target_min) + target_min,
                              target_min, target_max).astype(image.dtype)
 
-def create_zephir_data(volume_input: VolumeInput, zephir_folder, chunk_size=100, zrange=None, max_depth: Optional[int] = None):
+def create_zephir_data(volume_input: VolumeInput, zephir_folder, zrange=None, max_depth: Optional[int] = None):
     """
     Create ZephIR `data.h5` files from a volume source.
 
@@ -105,25 +105,15 @@ def create_zephir_data(volume_input: VolumeInput, zephir_folder, chunk_size=100,
 
     print(f"Processing {num_volumes} volumes with shape {shape} (Z, Y, X)")
 
-    num_chunks = (num_volumes + chunk_size - 1) // chunk_size
-
-    for chunk_idx in range(num_chunks):
-        start_t = chunk_idx * chunk_size
-        end_t = min(start_t + chunk_size, num_volumes)
-
-        subfolder_name = f"vol_{start_t}_{end_t-1}"
-        subfolder_path = os.path.join(zephir_folder, subfolder_name)
-        os.makedirs(subfolder_path, exist_ok=True)
-
-        chunk_vol_num = end_t - start_t
-        img_data = np.empty((chunk_vol_num, 1, shape[0], shape[1], shape[2]), dtype=np.uint8)
-
-        for i in range(chunk_vol_num):
-            idx = start_t + i
+    data_path = os.path.join(zephir_folder, 'data.h5')
+    with h5py.File(data_path, 'w') as hf:
+        ds = hf.create_dataset('data', shape=(num_volumes, 1, shape[0], shape[1], shape[2]), dtype='uint8', chunks=True)
+        
+        for i in range(num_volumes):
             if is_list:
-                vol = np.load(volume_input[idx])
+                vol = np.load(volume_input[i])
             else:
-                vol = arr[idx]
+                vol = arr[i]
 
             vol = _apply_zrange_and_depth(vol, zrange, max_depth)
 
@@ -131,11 +121,7 @@ def create_zephir_data(volume_input: VolumeInput, zephir_folder, chunk_size=100,
             vol = np.transpose(vol, (2, 0, 1))
 
             vol_scaled = rescale_image(vol, 0, 255).astype(np.uint8)
-            img_data[i, 0] = vol_scaled
-
-        data_path = os.path.join(subfolder_path, 'data.h5')
-        with h5py.File(data_path, 'w') as hf:
-            hf.create_dataset('data', data=img_data, chunks=True)
+            ds[i, 0] = vol_scaled
 
     return num_volumes, shape
 
@@ -145,112 +131,81 @@ def create_zephir_annotations(neuron_pt_tuple, zephir_folder, shape, chunk_size=
         neuron_pt_tuple = neuron_pt_tuple[np.newaxis, ...]
         
     total_t = neuron_pt_tuple.shape[0]
-    num_chunks = (total_t + chunk_size - 1) // chunk_size
     
     depth, height, width = shape # Z, Y, X
     
-    for chunk_idx in range(num_chunks):
-        start_t = chunk_idx * chunk_size
-        end_t = min(start_t + chunk_size, total_t)
+    h5file_path = os.path.join(zephir_folder, 'annotations.h5')
+    if os.path.exists(h5file_path):
+        os.remove(h5file_path)
         
-        subfolder_name = f"vol_{start_t}_{end_t-1}"
-        subfolder_path = os.path.join(zephir_folder, subfolder_name)
-        os.makedirs(subfolder_path, exist_ok=True)
+    with h5py.File(h5file_path, 'w') as f:
+        max_shape = (None,)
+        ds_x = f.create_dataset('/x', shape=(0,), maxshape=max_shape, dtype='float32')
+        ds_y = f.create_dataset('/y', shape=(0,), maxshape=max_shape, dtype='float32')
+        ds_z = f.create_dataset('/z', shape=(0,), maxshape=max_shape, dtype='float32')
+        ds_id = f.create_dataset('/id', shape=(0,), maxshape=max_shape, dtype='uint32')
+        ds_parent = f.create_dataset('/parent_id', shape=(0,), maxshape=max_shape, dtype='uint16')
+        ds_worldline = f.create_dataset('/worldline_id', shape=(0,), maxshape=max_shape, dtype='uint16')
+        ds_prov = f.create_dataset('/provenance', shape=(0,), maxshape=max_shape, dtype='S4')
+        ds_t = f.create_dataset('/t_idx', shape=(0,), maxshape=max_shape, dtype='uint32')
         
-        h5file_path = os.path.join(subfolder_path, 'annotations.h5')
-        if os.path.exists(h5file_path):
-            os.remove(h5file_path)
+        current_offset = 0
+        
+        for global_t in range(total_t):
+            points = neuron_pt_tuple[global_t]
             
-        with h5py.File(h5file_path, 'w') as f:
-            max_shape = (None,)
-            ds_x = f.create_dataset('/x', shape=(0,), maxshape=max_shape, dtype='float32')
-            ds_y = f.create_dataset('/y', shape=(0,), maxshape=max_shape, dtype='float32')
-            ds_z = f.create_dataset('/z', shape=(0,), maxshape=max_shape, dtype='float32')
-            ds_id = f.create_dataset('/id', shape=(0,), maxshape=max_shape, dtype='uint32')
-            ds_parent = f.create_dataset('/parent_id', shape=(0,), maxshape=max_shape, dtype='uint16')
-            ds_worldline = f.create_dataset('/worldline_id', shape=(0,), maxshape=max_shape, dtype='uint16')
-            ds_prov = f.create_dataset('/provenance', shape=(0,), maxshape=max_shape, dtype='S4')
-            ds_t = f.create_dataset('/t_idx', shape=(0,), maxshape=max_shape, dtype='uint32')
+            valid_mask = ~np.isnan(points[:, 0])
+            valid_points = points[valid_mask]
             
-            current_offset = 0
+            if valid_points.shape[0] == 0:
+                continue
             
-            for local_t in range(end_t - start_t):
-                global_t = start_t + local_t
-                points = neuron_pt_tuple[global_t]
-                
-                valid_mask = ~np.isnan(points[:, 0])
-                valid_points = points[valid_mask]
-                
-                if valid_points.shape[0] == 0:
-                    continue
-                
-                n_points = valid_points.shape[0]
-                
-                # Assuming coords are (X, Y, Z)
-                # Wait, in pipeline `translation_matching_bruteforce_with_dist` returns (row, col) -> (Y, X).
-                # And `shift_vector` is (shift_yx[1], shift_yx[0], 0) -> (X, Y, Z).
-                # So coords are (X, Y, Z).
-                
-                x = valid_points[:, 0]
-                y = valid_points[:, 1]
-                z = valid_points[:, 2]
-                
-                # ZephIR expects normalized coordinates
-                # x_rel = x / width
-                # y_rel = y / height
-                # z_rel = z / (z_ratio * depth)
-                
-                ds_x.resize((current_offset + n_points,))
-                ds_y.resize((current_offset + n_points,))
-                ds_z.resize((current_offset + n_points,))
-                ds_id.resize((current_offset + n_points,))
-                ds_parent.resize((current_offset + n_points,))
-                ds_worldline.resize((current_offset + n_points,))
-                ds_prov.resize((current_offset + n_points,))
-                ds_t.resize((current_offset + n_points,))
-                
-                ds_x[current_offset:] = x / width
-                ds_y[current_offset:] = y / height
-                ds_z[current_offset:] = z / (z_ratio * depth)
-                
-                indices = np.where(valid_mask)[0]
-                ds_worldline[current_offset:] = indices.astype(np.uint16)
-                ds_id[current_offset:] = np.arange(current_offset + 1, current_offset + n_points + 1)
-                ds_t[current_offset:] = local_t
-                
-                current_offset += n_points
+            n_points = valid_points.shape[0]
+            
+            x = valid_points[:, 0]
+            y = valid_points[:, 1]
+            z = valid_points[:, 2]
+            
+            ds_x.resize((current_offset + n_points,))
+            ds_y.resize((current_offset + n_points,))
+            ds_z.resize((current_offset + n_points,))
+            ds_id.resize((current_offset + n_points,))
+            ds_parent.resize((current_offset + n_points,))
+            ds_worldline.resize((current_offset + n_points,))
+            ds_prov.resize((current_offset + n_points,))
+            ds_t.resize((current_offset + n_points,))
+            
+            ds_x[current_offset:] = x / width
+            ds_y[current_offset:] = y / height
+            ds_z[current_offset:] = z / (z_ratio * depth)
+            
+            indices = np.where(valid_mask)[0]
+            ds_worldline[current_offset:] = indices.astype(np.uint16)
+            ds_id[current_offset:] = np.arange(current_offset + 1, current_offset + n_points + 1)
+            ds_t[current_offset:] = global_t
+            
+            current_offset += n_points
 
 def create_metadata_json(zephir_folder, num_volumes, shape, chunk_size=100):
-    num_chunks = (num_volumes + chunk_size - 1) // chunk_size
     depth, height, width = shape
     
-    for chunk_idx in range(num_chunks):
-        start_t = chunk_idx * chunk_size
-        end_t = min(start_t + chunk_size, num_volumes)
-        chunk_vol_num = end_t - start_t
-        
-        subfolder_name = f"vol_{start_t}_{end_t-1}"
-        subfolder_path = os.path.join(zephir_folder, subfolder_name)
-        os.makedirs(subfolder_path, exist_ok=True)
-        
-        metadata = {
-            "shape_t": chunk_vol_num,
-            "shape_c": 1,
-            "shape_z": depth,
-            "shape_y": height,
-            "shape_x": width,
-            "dtype": "uint8"
-        }
-        
-        with open(os.path.join(subfolder_path, 'metadata.json'), 'w') as f:
-            json.dump(metadata, f, indent=2)
+    metadata = {
+        "shape_t": num_volumes,
+        "shape_c": 1,
+        "shape_z": depth,
+        "shape_y": height,
+        "shape_x": width,
+        "dtype": "uint8"
+    }
+    
+    with open(os.path.join(zephir_folder, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
 
 
 def convert_npy_to_ZephIR_format(
     volume_input: VolumeInput,
     neuron_pt_tuple_source: Union[str, np.ndarray],
     zephir_folder: str,
-    chunk_size: int = 100,
     zrange: Optional[Tuple[int, int]] = None,
     z_ratio: float = 5.0,
     max_depth: Optional[int] = 20,
@@ -268,16 +223,9 @@ def convert_npy_to_ZephIR_format(
     if neuron_pt_tuple.ndim == 2:
         neuron_pt_tuple = neuron_pt_tuple[np.newaxis, ...]
 
-    if max_depth is not None:
-        upper = max_depth - 1
-        if upper < 0:
-            raise ValueError("max_depth must be >= 1 when provided")
-        neuron_pt_tuple[..., 2] = np.clip(neuron_pt_tuple[..., 2], 0, upper)
-
     num_volumes, shape = create_zephir_data(
         volume_input,
         zephir_folder,
-        chunk_size=chunk_size,
         zrange=zrange,
         max_depth=max_depth,
     )
@@ -285,8 +233,7 @@ def convert_npy_to_ZephIR_format(
         neuron_pt_tuple,
         zephir_folder,
         shape,
-        chunk_size=chunk_size,
         z_ratio=z_ratio,
     )
-    create_metadata_json(zephir_folder, num_volumes, shape, chunk_size=chunk_size)
+    create_metadata_json(zephir_folder, num_volumes, shape)
     return shape
