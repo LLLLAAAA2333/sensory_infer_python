@@ -704,6 +704,9 @@ if __name__ == '__main__':
         )
         print_info_message("MIP mode processing finished.")
         
+if args.transfer_zephir_path:
+            print_info_message("ZephIR export finished. Stopping pipeline as requested.")
+            sys.exit(0)
     else:
         if not args.ref_volumes_dir:
             raise ValueError("'--ref-volumes-dir' is required for non-mip processing modes.")
@@ -751,8 +754,8 @@ if __name__ == '__main__':
                 max_depth=args.neuron_depth_limit,
             )
             print_info_message("ZephIR conversion complete; skipping experimental intensity extraction.")
-            ex_neuron_pt_tuple = None
-            all_intensities_df = None
+            print_info_message("ZephIR export finished. Stopping pipeline as requested.")
+            sys.exit(0)
         else:
             ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
             ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
