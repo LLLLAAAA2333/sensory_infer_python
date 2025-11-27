@@ -165,7 +165,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     ex_folder_files = [load_datapath(folder) for folder in ex_vol_folders]
     ex_seg_counts = np.array([len(files) for files in ex_folder_files], dtype=np.int32)
 
-    all_intensities_df = pd.DataFrame(index=range(N_neurons))
+    # all_intensities_df = pd.DataFrame(index=range(N_neurons))
+    all_intensities_list = []
     global_frame_counter = 0
     ex_tuples = []
 
@@ -352,7 +353,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             intensity_values = np.asarray(intensity_values)
             intensity_indices = np.asarray(intensity_indices)
             if intensity_indices.size == 0:
-                all_intensities_df[global_frame_counter] = pd.Series(np.nan, index=range(N_neurons))
+                # all_intensities_df[global_frame_counter] = pd.Series(np.nan, index=range(N_neurons))
+                all_intensities_list.append(pd.Series(np.nan, index=range(N_neurons)))
                 global_frame_counter += 1
                 continue
             
@@ -368,7 +370,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             vol_intensity = pd.Series(np.nan, index=range(N_neurons))
             original_indices = np.where(final_valid_mask)[0][intensity_indices]
             vol_intensity.iloc[original_indices] = intensity_values
-            all_intensities_df[global_frame_counter] = vol_intensity
+            # all_intensities_df[global_frame_counter] = vol_intensity
+            all_intensities_list.append(vol_intensity)
             global_frame_counter += 1
 
             if volume_progress is not None:
@@ -378,6 +381,12 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     if volume_progress is not None:
         volume_progress.close()
         
+
+    if all_intensities_list:
+        all_intensities_df = pd.concat(all_intensities_list, axis=1)
+        all_intensities_df.columns = range(len(all_intensities_list))
+    else:
+        all_intensities_df = pd.DataFrame(index=range(N_neurons))
     # save as CSV
     output_csv_path = os.path.join(output_dir, "neuron_intensities_extracted.csv")
     all_intensities_df.to_csv(output_csv_path, index_label="neuron_index")
@@ -487,7 +496,7 @@ def run_mip_inference_and_extract(
             max_depth=neuron_depth_limit,
         )
         return None, None, ex_vol_paths
-
+    
     if shift_list is None:
         raise FileNotFoundError("Shift list not found; cannot extract intensities in MIP mode.")
 
@@ -704,7 +713,7 @@ if __name__ == '__main__':
         )
         print_info_message("MIP mode processing finished.")
         
-if args.transfer_zephir_path:
+        if args.transfer_zephir_path:
             print_info_message("ZephIR export finished. Stopping pipeline as requested.")
             sys.exit(0)
     else:
