@@ -15,7 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 
 from src.infer_sequence import run_inference_on_volume_sequence
 from src.infer_single import run_inference_on_single_volume
-from src.inference.volume_alignment import compute_distance, volume_alignment
+from src.inference.volume_alignment import compute_distance, volume_alignment, compute_distance_fft
 from src.inference.blur import get_image4processing, pixel_threshold
 from src.inference.intensity_extract import extract_neuron_intensities_torch
 from src.merge_resize_inference import Treeformer_End2End
@@ -117,6 +117,30 @@ def translation_matching_bruteforce_with_dist(volume1_gpu, volume2_gpu, shiftran
     shift_yx = (min_distance_index[0] - shiftrange[0] // 2, min_distance_index[1] - shiftrange[1] // 2)
     return shift_yx, min_distance.item()
 
+def translation_matching_fft_with_dist(volume1_gpu, volume2_gpu, shiftrange=(21, 21), device='cuda'):
+    """
+    Args:
+        (Y, X, Z) format GPU Tensors.
+        Return (row_shift, col_shift) and min_distance.
+    """
+    binary_volume1_mask = pixel_threshold(volume1_gpu)
+    binary_volume2_mask = pixel_threshold(volume2_gpu)
+
+    binary_image1 = get_image4processing(binary_volume1_mask).to(torch.int)
+    binary_image2 = get_image4processing(binary_volume2_mask).to(torch.int)
+
+    if binary_image1.shape != binary_image2.shape:
+        print_warning_message(f"MIP shape mismatch {binary_image1.shape} vs {binary_image2.shape}. Skipping alignment.")
+        return
+
+    rows, cols = binary_image2.shape
+    distance_matrix = compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange)
+    min_distance, min_idx = torch.min(distance_matrix.reshape(-1), 0)
+    min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
+
+    shift_yx = (min_distance_index[0] - shiftrange[0] // 2, min_distance_index[1] - shiftrange[1] // 2)
+    return shift_yx, min_distance.item()
+
 def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
     if path not in cache:
         vol_data = np.load(path)
@@ -127,7 +151,7 @@ def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
     return cache[path]
 
 def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_dir,
-                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None):
+                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None, align_method='bruteforce'):
     """
     Args:
         ref_coords: numpy array of shape (T_ref, N_neurons, F_features)
@@ -135,10 +159,12 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
         output_dir: directory to save outputs
         mode: 'interpolate', 'align', or 'dual_propagate'
         shiftrange: tuple for bruteforce mode and align mode
+        align_method: 'bruteforce' or 'fft'
     """
     T_ref, N_neurons, F_features = ref_coords.shape
     print_log_message(f"Loaded reference matrix: {T_ref} ref volumes, {N_neurons} unique neurons, {F_features} features.")
     print_info_message(f"Running in mode: '{mode}'")
+    matching_func = translation_matching_fft_with_dist if align_method == 'fft' else translation_matching_bruteforce_with_dist
 
     if len(ex_vol_folders) != T_ref - 1:
         print_warning_message(f"Mismatch! Found {T_ref} ref volumes but {len(ex_vol_folders)} experimental volume folders. Expected {T_ref - 1} folders.")
@@ -199,7 +225,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             print_log_message(f"  Aligning ref_A to ex_vol_0...")
             vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device, zrange=zrange)
-            shift_yx, dist = translation_matching_bruteforce_with_dist(ref_A_vol_gpu, vol_k_minus_1_gpu, shiftrange, device)
+            shift_yx, dist = matching_func(ref_A_vol_gpu, vol_k_minus_1_gpu, shiftrange, device)
             current_f_coords = ref_start_coords.copy()
             shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_f_coords.dtype)
             current_f_coords[:, :3] -= shift_vector
@@ -209,7 +235,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             for k in range(1, num_ex_vols):
                 vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
-                shift_yx, dist = translation_matching_bruteforce_with_dist(vol_k_minus_1_gpu, vol_k_gpu, shiftrange, device)
+                shift_yx, dist = matching_func(vol_k_minus_1_gpu, vol_k_gpu, shiftrange, device)
                 shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_f_coords.dtype)
                 current_f_coords[:, :3] -= shift_vector
                 forward_coords[k] = current_f_coords.copy()
@@ -219,7 +245,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             print_log_message(f"  Aligning ref_B to ex_vol_{num_ex_vols - 1}...")
             vol_k_plus_1_gpu = load_ex_vol_gpu(ex_files[-1], {}, device, zrange=zrange)
-            shift_yx, dist = translation_matching_bruteforce_with_dist(ref_B_vol_gpu, vol_k_plus_1_gpu, shiftrange, device)
+            shift_yx, dist = matching_func(ref_B_vol_gpu, vol_k_plus_1_gpu, shiftrange, device)
 
             current_b_coords = ref_end_coords.copy()
             shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_b_coords.dtype)
@@ -229,7 +255,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             for k in range(num_ex_vols - 2, -1, -1):
                 vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
-                shift_yx, dist = translation_matching_bruteforce_with_dist(vol_k_plus_1_gpu, vol_k_gpu, shiftrange, device)
+                shift_yx, dist = matching_func(vol_k_plus_1_gpu, vol_k_gpu, shiftrange, device)
                 shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_b_coords.dtype)
                 current_b_coords[:, :3] -= shift_vector
                 backward_coords[k] = current_b_coords.copy()
@@ -274,8 +300,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 ex_vol_k_gpu = torch.from_numpy(ex_vol_k_data).to(device).float()
                 
                 # align with ref volumes
-                shift_A, dist_A = translation_matching_bruteforce_with_dist(ref_A_vol_gpu, ex_vol_k_gpu, shiftrange, device)
-                shift_B, dist_B = translation_matching_bruteforce_with_dist(ref_B_vol_gpu, ex_vol_k_gpu, shiftrange, device)
+                shift_A, dist_A = matching_func(ref_A_vol_gpu, ex_vol_k_gpu, shiftrange, device)
+                shift_B, dist_B = matching_func(ref_B_vol_gpu, ex_vol_k_gpu, shiftrange, device)
                 coords_A = ref_start_coords.copy()
                 coords_B = ref_end_coords.copy()
 
@@ -456,6 +482,7 @@ def run_mip_inference_and_extract(
     os.makedirs(synthetic_volume_save_path, exist_ok=True)
 
     shiftrange = kwargs.get('shiftrange', (101, 101))
+    align_method = kwargs.get('align_method', 'bruteforce')
     aligned_path = os.path.join(synthetic_volume_save_path, 'aligned_volumes_mip.npy')
     shift_path = os.path.join(synthetic_volume_save_path, 'shift_list.npy')
     neuron_tuple_path = os.path.join(synthetic_volume_save_path, 'neuron_pt_tuple.npy')
@@ -474,6 +501,7 @@ def run_mip_inference_and_extract(
             synthetic_volume_save_path,
             shiftrange=shiftrange,
             zrange=zrange,
+            align_method=align_method,
         )
         np.save(aligned_path, aligned_volumes_mip)
         np.save(shift_path, shift_list)
@@ -663,6 +691,8 @@ if __name__ == '__main__':
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
                         help="Local search range (Rows,Cols) for 'align' or 'dual_propagate' mode, e.g., '21,21' for +/- 10 pixels.")
+    parser.add_argument('--align-method', type=str, choices=['bruteforce', 'fft'], default='bruteforce',
+                        help="Method for alignment: 'bruteforce' (exhaustive search) or 'fft' (fast fourier transform).")
 
     parser.set_defaults(skip_inference=False)
 
@@ -709,7 +739,8 @@ if __name__ == '__main__':
             pre_resize=args.pre_resize,
             pre_resize_size=args.pre_resize_size,
             pre_rescale_pixels=args.pre_rescale_pixels,
-            shiftrange=shiftrange
+            shiftrange=shiftrange,
+            align_method=args.align_method
         )
         print_info_message("MIP mode processing finished.")
         
@@ -776,6 +807,7 @@ if __name__ == '__main__':
                 device=device,
                 shiftrange=shiftrange,
                 zrange=config_zrange,
+                align_method=args.align_method,
             )
             print_info_message("Processing finished.")
 
