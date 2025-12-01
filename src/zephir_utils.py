@@ -125,7 +125,7 @@ def create_zephir_data(volume_input: VolumeInput, zephir_folder, zrange=None, ma
 
     return num_volumes, shape
 
-def create_zephir_annotations(neuron_pt_tuple, zephir_folder, shape, chunk_size=100, z_ratio=5.0):
+def create_zephir_annotations(neuron_pt_tuple, zephir_folder, shape, z_ratio=5.0):
     # neuron_pt_tuple: (T, N, F) or (N, F)
     if neuron_pt_tuple.ndim == 2:
         neuron_pt_tuple = neuron_pt_tuple[np.newaxis, ...]
@@ -181,6 +181,7 @@ def create_zephir_annotations(neuron_pt_tuple, zephir_folder, shape, chunk_size=
             
             indices = np.where(valid_mask)[0]
             ds_worldline[current_offset:] = indices.astype(np.uint16)
+            ds_prov[current_offset:] = np.array(['ANTT'] * n_points, dtype='S4')
             ds_id[current_offset:] = np.arange(current_offset + 1, current_offset + n_points + 1)
             ds_t[current_offset:] = global_t
             
