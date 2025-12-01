@@ -1,9 +1,11 @@
 import os
 import sys
 import torch
+import torch.fft
 import numpy as np
 from tqdm import tqdm
 import cv2
+from typing import Tuple
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 from src.inference.blur import pixel_threshold, get_image4processing
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
@@ -19,14 +21,17 @@ def pixel2binary(image, rate=0.98):
 def Euclidean_distance(image1, image2):
     return torch.sum((image1 - image2) ** 2)
 
-def compute_distance(binary_image1, binary_image2, rows, cols, shiftrange=(61, 61)):
+@torch.jit.script
+def compute_distance(binary_image1: torch.Tensor, binary_image2: torch.Tensor, rows: int, cols: int, shiftrange: Tuple[int, int]=(61, 61)):
     """
     Each entry in distance_matrix represents the euclidean distance between image 1 and image 2 which moved (i-nrow/2, j-ncol/2)
     """
-    distance_matrix = torch.zeros(shiftrange[0], shiftrange[1], device='cuda')
+    sr0 = int(shiftrange[0])
+    sr1 = int(shiftrange[1])
+    distance_matrix = torch.zeros(sr0, sr1, device='cuda')
 
-    for i_idx, i in enumerate(range(-shiftrange[0]//2+1,shiftrange[0]//2+1)):
-        for j_idx, j in enumerate(range(-shiftrange[1]//2+1,shiftrange[1]//2+1)):
+    for i_idx, i in enumerate(range(-sr0//2+1, sr0//2+1)):
+        for j_idx, j in enumerate(range(-sr1//2+1, sr1//2+1)):
             aligned_image2 = torch.roll(binary_image2, shifts=i, dims=0)
             aligned_image2 = torch.roll(aligned_image2, shifts=j, dims=1)
 
@@ -85,7 +90,7 @@ def _apply_zrange(volume_np, zrange=None):
     return volume_np[:, :, z_start:z_end]
 
 
-def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None):
+def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None, align_method='bruteforce'):
     """
     Align volumes, return the synthetic volume and shift pixels of each volume comparing to the initial volume
     """
@@ -102,7 +107,10 @@ def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None):
         volume = torch.from_numpy(volume).cuda()
         # image = get_image4processing(volume)
 
-        shift = translation_matching(torch.from_numpy(reference_volume).cuda(), volume, shiftrange)
+        if align_method == 'fft':
+            shift = translation_matching_fft(torch.from_numpy(reference_volume).cuda(), volume, shiftrange)
+        else:
+            shift = translation_matching(torch.from_numpy(reference_volume).cuda(), volume, shiftrange)
         shift_list.append(shift)
         
         if index % 20 == 0:
@@ -147,3 +155,70 @@ def translation_matching_phase_corr(volume1_gpu, volume2_gpu, device='cuda'):
     shift_x, shift_y = shift_xy
     shift_yx = (shift_y, shift_x)
     return shift_yx, -response
+
+def compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange=(61, 61)):
+    """
+    Optimized distance computation using FFT.
+    Calculates sum((A - B_shift)^2) = sum(A^2) + sum(B^2) - 2*convolution(A, B)
+    """
+    # Ensure inputs are float for FFT
+    img1 = binary_image1.float()
+    img2 = binary_image2.float()
+
+    # 1. Compute constant terms (Sum of squares)
+    # Note: sum(rolled_img^2) is constant for circular shifts
+    sum_sq1 = torch.sum(img1 ** 2)
+    sum_sq2 = torch.sum(img2 ** 2)
+
+    # 2. Compute Cross-Correlation using FFT
+    # CrossCorr(A, B) = IFFT( FFT(A) * conj(FFT(B)) )
+    f1 = torch.fft.rfft2(img1)
+    f2 = torch.fft.rfft2(img2)
+    cross_corr = torch.fft.irfft2(f1 * torch.conj(f2), s=img1.shape)
+
+    # 3. Calculate Euclidean Distance Map
+    # distance^2 = A^2 + B^2 - 2AB
+    dist_map = sum_sq1 + sum_sq2 - 2 * cross_corr
+
+    # 4. Handle Quadrant Shift
+    # FFT output has shift 0 at index [0,0]. We need to center it.
+    dist_map = torch.fft.fftshift(dist_map)
+
+    # 5. Crop the center region corresponding to shiftrange
+    H, W = dist_map.shape
+    cy, cx = H // 2, W // 2
+    rh, rw = shiftrange[0] // 2, shiftrange[1] // 2
+    
+    # Note: Adjust logic to match exact range of original loop (-h/2+1 to h/2+1)
+    # Original loop creates matrix of size shiftrange[0] x shiftrange[1]
+    
+    # Safe cropping
+    y1 = cy - rh + 1 
+    y2 = y1 + shiftrange[0]
+    x1 = cx - rw + 1
+    x2 = x1 + shiftrange[1]
+    
+    distance_matrix = dist_map[y1:y2, x1:x2]
+
+    return distance_matrix
+
+def translation_matching_fft(volume1, volume2, shiftrange=(61, 61)):
+    """
+    Compute the intersection of image 1 and shifted image 2 using FFT
+    return the proper row shift and column shift
+    """
+    if volume1.shape != volume2.shape:
+        raise ValueError("Images must have the same shape")
+
+    binary_volume1 = pixel_threshold(volume1)
+    binary_volume2 = pixel_threshold(volume2)
+    binary_image1 = get_image4processing(binary_volume1).to(torch.int)
+    binary_image2 = get_image4processing(binary_volume2).to(torch.int)
+
+    rows, cols = binary_image2.shape
+
+    distance_matrix = compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange)
+    min_distance, min_idx = torch.min(distance_matrix.reshape(-1), 0)
+    min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
+
+    return (min_distance_index[0]-shiftrange[0]//2, min_distance_index[1]-shiftrange[1]//2)
