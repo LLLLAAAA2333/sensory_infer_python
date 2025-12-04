@@ -118,150 +118,9 @@ def pixel_intensity_extraction(file_list, shift_list, neuron_pt_tuple, save_path
     return intensity_df
 
 # ---------------------------------new intensity extraction(convolution) ---------------------------------
-def cxcywh2xyxy_torch(x):
-    y = x.clone()
-    y[..., 0] = x[..., 0] - x[..., 2] * 0.5  # top left x
-    y[..., 1] = x[..., 1] - x[..., 3] * 0.5  # top left y
-    y[..., 2] = x[..., 0] + x[..., 2] * 0.5  # bottom right x
-    y[..., 3] = x[..., 1] + x[..., 3] * 0.5  # bottom right y
-    return y
-
-def get_bounding_box_torch(x, y, z, width, height, depth, vol_dims_y_x_z, device='cuda'):
-    y_dim, x_dim, z_dim = vol_dims_y_x_z
-    
-    bbox_cxcywh = torch.tensor([x, y, width, height], device=device)
-    bbox_xyxy = cxcywh2xyxy_torch(bbox_cxcywh)
-    
-    x_min = max(0, int(bbox_xyxy[0]))
-    y_min = max(0, int(bbox_xyxy[1]))
-    x_max = min(x_dim, int(bbox_xyxy[2]))
-    y_max = min(y_dim, int(bbox_xyxy[3]))
-    
-    z_min = max(0, int(np.ceil(z - depth / 2.0)))
-    z_max = min(z_dim, int(np.ceil(z + depth / 2.0)))
-
-    valid = (x_min <= x_max) and (y_min <= y_max) and (z_min <= z_max)
-    return (x_min, x_max, y_min, y_max, z_min, z_max), valid
-
-def create_ellipse_mask_torch(roi_shape_yx, device):
-    h, w = roi_shape_yx # h = Y, w = X
-    cy, cx = h / 2 - 0.5, w / 2 - 0.5
-    y, x = torch.meshgrid(torch.arange(h, device=device), 
-                          torch.arange(w, device=device), indexing='ij')
-    
-    w_radius = w / 2.0
-    h_radius = h / 2.0
-    
-    if w_radius <= 0 or h_radius <= 0:
-        return torch.zeros(roi_shape_yx, dtype=torch.bool, device=device)
-        
-    mask = ((x - cx)**2 / w_radius**2 + (y - cy)**2 / h_radius**2) <= 1
-    return mask
-
-def calculate_intensity_conv_torch(volume, bbox, threshold, background_threshold, area_ratio=0.8, device = 'cuda'):
-    """
-    Calculate neuron intensity within a 3D ROI using a median-based selection per Z slice
-    and a sliding window along Z to find the brightest contiguous segment.
-
-    Notes:
-    - The 'threshold' argument is ignored (kept for backward compatibility).
-    - We compute, per Z slice, the mean of pixels >= median inside an elliptical ROI.
-      To avoid NaNs when no pixel is strictly above median (e.g., constant slices),
-      we fall back to using all masked pixels in that window.
-    - background_threshold is subtracted from the final average.
-    """
-    x_min, x_max, y_min, y_max, z_min, z_max = bbox
-    # Use right-open slicing semantics consistently; depth equals number of slices
-    vol_bbox = volume[y_min:y_max+1, x_min:x_max+1, z_min:z_max+1]
-
-    if vol_bbox.numel() == 0:
-        return np.nan, []
-
-    y_range, x_range, z_range = vol_bbox.shape
-    neuron_depth = z_range  # fix off-by-one (previously used +1)
-
-    # Build central elliptical ROI with area_ratio
-    eff_h = int(max(1, round(y_range * area_ratio)))
-    eff_w = int(max(1, round(x_range * area_ratio)))
-    h_start = (y_range - eff_h) // 2
-    h_end = h_start + eff_h
-    w_start = (x_range - eff_w) // 2
-    w_end = w_start + eff_w
-
-    if h_start >= h_end or w_start >= w_end:
-        return np.nan, []
-
-    mask_2d = torch.zeros((y_range, x_range), dtype=torch.bool, device=device)
-    mask_2d[h_start:h_end, w_start:w_end] = create_ellipse_mask_torch((eff_h, eff_w), device=device)
-
-    counts_masked = int(mask_2d.sum().item())
-    if counts_masked == 0:
-        return np.nan, []
-
-    # Prepare per-Z sums/counts using median-based selection
-    sums_above_med = torch.zeros((z_range,), dtype=vol_bbox.dtype, device=device)
-    counts_above_med = torch.zeros((z_range,), dtype=torch.int32, device=device)
-    sums_masked = torch.zeros((z_range,), dtype=vol_bbox.dtype, device=device)
-
-    for zi in range(z_range):
-        slice_2d = vol_bbox[:, :, zi]
-        vals = slice_2d[mask_2d]
-        # In rare empty cases (shouldn't happen due to counts_masked check), skip
-        if vals.numel() == 0:
-            continue
-        med = torch.median(vals)
-        sel = vals >= med  # use >= to reduce zero-count cases while matching robust behavior
-        cnt_sel = int(sel.sum().item())
-        if cnt_sel > 0:
-            sums_above_med[zi] = vals[sel].sum()
-            counts_above_med[zi] = cnt_sel
-        else:
-            # Keep zero here; we'll fall back to all masked in window aggregation
-            sums_above_med[zi] = torch.tensor(0.0, dtype=vol_bbox.dtype, device=device)
-            counts_above_med[zi] = 0
-        sums_masked[zi] = vals.sum()
-
-    # Sliding window along Z using conv1d on GPU
-    window_size = min(3, int(neuron_depth))
-    if z_range < window_size:
-        window_size = z_range
-    if window_size == 0:
-        return np.nan, []
-
-    kernel = torch.ones((1, 1, window_size), dtype=vol_bbox.dtype, device=device)
-
-    sums_above_win = F.conv1d(sums_above_med.view(1, 1, -1), kernel, padding=0).view(-1)
-    counts_above_win = F.conv1d(counts_above_med.to(dtype=vol_bbox.dtype).view(1, 1, -1), kernel, padding=0).view(-1)
-
-    sums_masked_win = F.conv1d(sums_masked.view(1, 1, -1), kernel, padding=0).view(-1)
-    counts_masked_win = counts_masked * window_size
-
-    # Avoid division by zero: fallback to masked sums when no above-median pixels in a window
-    use_fallback = counts_above_win <= 0
-    avg_win = torch.empty_like(sums_above_win)
-    # primary
-    avg_primary = sums_above_win / torch.clamp_min(counts_above_win, 1e-6)
-    # fallback
-    avg_fallback = sums_masked_win / counts_masked_win
-    avg_win = torch.where(use_fallback, avg_fallback, avg_primary)
-
-    if avg_win.numel() == 0:
-        return np.nan, []
-
-    max_window_start_idx = int(torch.argmax(avg_win).item())
-    max_average_intensity = float(avg_win[max_window_start_idx].item())
-
-    best_slices = np.arange(
-        z_min + max_window_start_idx,
-        z_min + max_window_start_idx + window_size
-    )
-
-    return max_average_intensity - background_threshold, best_slices
-
 def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, background_threshold=0.0, device='cuda'):
     """
-    Extract per-neuron intensity using median-based selection per Z slice and
-    a sliding window to find the brightest contiguous Z segment.
+    Extract per-neuron intensity using vectorized grid_sample and a sliding window to find the brightest contiguous Z segment.
 
     Args:
         volume (np.ndarray): 3D volume data (Y, X, Z).
@@ -270,47 +129,172 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
         background_threshold (float): Value to subtract from final average intensity. Default 0.0.
         device (str): 'cuda' or 'cpu'.
     """
-    if isinstance(volume, np.ndarray) and volume.dtype == np.uint16:
-        volume = volume.astype(np.float32)
-    elif isinstance(volume, np.ndarray) and volume.dtype not in (np.float32, np.float64, np.int32, np.int16, np.int8, np.uint8, np.bool_):
-        volume = volume.astype(np.float32)
-    volume_3d = torch.from_numpy(volume).to(device)
-    vol_dims_y_x_z = volume_3d.shape
+    # 1. Prepare Volume
+    if isinstance(volume, np.ndarray):
+        if volume.dtype == np.uint16:
+            volume = volume.astype(np.float32)
+        elif volume.dtype not in (np.float32, np.float64, np.int32, np.int16, np.int8, np.uint8, np.bool_):
+            volume = volume.astype(np.float32)
+        volume_3d = torch.from_numpy(volume).to(device)
+    else:
+        volume_3d = volume.to(device)
+
+    vol_y, vol_x, vol_z = volume_3d.shape
+    # Reshape to (1, 1, Z, Y, X) for grid_sample (treating Z as depth, Y as height, X as width)
+    # grid_sample input: (N, C, D_in, H_in, W_in)
+    vol_batch = volume_3d.permute(2, 0, 1).unsqueeze(0).unsqueeze(0) 
+    
+    # 2. Prepare Neuron Data
+    if not isinstance(neuron_pt_tuple, torch.Tensor):
+        neuron_pt_tuple = torch.tensor(neuron_pt_tuple, device=device, dtype=torch.float32)
+    else:
+        neuron_pt_tuple = neuron_pt_tuple.to(device=device, dtype=torch.float32)
+
+    N = neuron_pt_tuple.shape[0]
+    if N == 0:
+        return np.array([]), np.array([]), {}
+
+    # Extract columns: [cx, cy, z*5, w, h, d*5]
+    cx = neuron_pt_tuple[:, 0]
+    cy = neuron_pt_tuple[:, 1]
+    z_raw = neuron_pt_tuple[:, 2]
+    w = neuron_pt_tuple[:, 3]
+    h = neuron_pt_tuple[:, 4]
+    
+    if neuron_pt_tuple.shape[1] > 5:
+        d_raw = neuron_pt_tuple[:, 5]
+    else:
+        d_raw = torch.full((N,), 10.0, device=device) # default depth 2.0 * 5 = 10.0
+
+    z_center = z_raw / 5.0
+    depth = d_raw / 5.0
+    
+    # Calculate integer Z bounds
+    z_min = torch.ceil(z_center - depth / 2.0).int()
+    z_max = torch.ceil(z_center + depth / 2.0).int()
+    
+    d_int = z_max - z_min
+    d_int = torch.clamp(d_int, min=1)
+    
+    max_d = int(d_int.max().item())
+    
+    # Determine ROI size for X, Y (use max size to avoid downsampling)
+    max_w = int(w.max().item()) if w.numel() > 0 else 16
+    max_h = int(h.max().item()) if h.numel() > 0 else 16
+    
+    # Clamp size to reasonable bounds
+    S_x = max(16, min(max_w, 128))
+    S_y = max(16, min(max_h, 128))
+    
+    # 3. Construct Grid (N, max_d, S_y, S_x, 3)
+    # Z coordinates
+    range_z = torch.arange(max_d, device=device, dtype=torch.float32)
+    z_coords = z_min.unsqueeze(1) + range_z.unsqueeze(0) # (N, max_d)
+    valid_z_mask = range_z.unsqueeze(0) < d_int.unsqueeze(1) # (N, max_d)
+    
+    # Normalize Z to [-1, 1]
+    z_norm = (2.0 * z_coords / (vol_z - 1.0)) - 1.0
+    
+    # Y, X coordinates (normalized to [-1, 1] for the ROI)
+    range_y = torch.linspace(-0.5, 0.5, S_y, device=device)
+    range_x = torch.linspace(-0.5, 0.5, S_x, device=device)
+    
+    # Map ROI [-0.5, 0.5] to Volume Coordinates
+    # y_vol = cy + y_roi * h
+    y_grid = cy.view(N, 1, 1) + range_y.view(1, S_y, 1) * h.view(N, 1, 1)
+    x_grid = cx.view(N, 1, 1) + range_x.view(1, 1, S_x) * w.view(N, 1, 1)
+    
+    # Normalize to [-1, 1]
+    y_norm = (2.0 * y_grid / (vol_y - 1.0)) - 1.0
+    x_norm = (2.0 * x_grid / (vol_x - 1.0)) - 1.0
+    
+    # Expand to (N, max_d, S_y, S_x)
+    z_expanded = z_norm.view(N, max_d, 1, 1).expand(N, max_d, S_y, S_x)
+    y_expanded = y_norm.view(N, 1, S_y, 1).expand(N, max_d, S_y, S_x)
+    x_expanded = x_norm.view(N, 1, 1, S_x).expand(N, max_d, S_y, S_x)
+    
+    grid = torch.stack((x_expanded, y_expanded, z_expanded), dim=-1)
+    
+    # 4. Sample
+    vol_batch_expanded = vol_batch.expand(N, -1, -1, -1, -1)
+    samples = F.grid_sample(vol_batch_expanded, grid, align_corners=True, padding_mode='zeros')
+    samples = samples.squeeze(1) # (N, max_d, S_y, S_x)
+    
+    # 5. Masking (Ellipse)
+    y_rel = range_y.view(1, S_y, 1)
+    x_rel = range_x.view(1, 1, S_x)
+    dist_sq = y_rel**2 + x_rel**2
+    threshold_sq = (0.5 * area_ratio)**2
+    mask_2d = dist_sq <= threshold_sq # (1, S_y, S_x)
+    
+    samples_flat = samples.view(N, max_d, -1)
+    mask_flat = mask_2d.view(-1)
+    masked_samples = samples_flat[:, :, mask_flat] # (N, max_d, K)
+    
+    # 6. Compute Statistics per Slice
+    # Median
+    medians = torch.median(masked_samples, dim=-1).values # (N, max_d)
+    mask_above = masked_samples >= medians.unsqueeze(-1)
+    
+    sums_above = (masked_samples * mask_above).sum(dim=-1)
+    counts_above = mask_above.sum(dim=-1).float()
+    
+    sums_all = masked_samples.sum(dim=-1)
+    counts_all = torch.tensor(masked_samples.shape[-1], device=device, dtype=torch.float32)
+    
+    # Zero out invalid Z slices
+    sums_above = sums_above * valid_z_mask
+    counts_above = counts_above * valid_z_mask
+    sums_all = sums_all * valid_z_mask
+    
+    # 7. Sliding Window (Kernel 3)
+    sums_above_padded = F.pad(sums_above.unsqueeze(1), (0, 2))
+    counts_above_padded = F.pad(counts_above.unsqueeze(1), (0, 2))
+    sums_all_padded = F.pad(sums_all.unsqueeze(1), (0, 2))
+    counts_all_padded = counts_all * F.pad(valid_z_mask.unsqueeze(1).float(), (0, 2))
+    
+    kernel = torch.ones((1, 1, 3), device=device)
+    
+    sums_above_win = F.conv1d(sums_above_padded, kernel).squeeze(1)
+    counts_above_win = F.conv1d(counts_above_padded, kernel).squeeze(1)
+    sums_all_win = F.conv1d(sums_all_padded, kernel).squeeze(1)
+    counts_all_win = F.conv1d(counts_all_padded, kernel).squeeze(1)
+    
+    avg_primary = sums_above_win / torch.clamp_min(counts_above_win, 1e-6)
+    avg_fallback = sums_all_win / torch.clamp_min(counts_all_win, 1e-6)
+    avg_win = torch.where(counts_above_win > 0, avg_primary, avg_fallback)
+    
+    # Mask out invalid windows
+    win_idx = torch.arange(max_d, device=device).unsqueeze(0)
+    depth_tensor = d_int.unsqueeze(1)
+    cond_ge_3 = (depth_tensor >= 3) & (win_idx <= depth_tensor - 3)
+    cond_lt_3 = (depth_tensor < 3) & (win_idx == 0)
+    valid_win_mask = cond_ge_3 | cond_lt_3
+    
+    avg_win[~valid_win_mask] = -float('inf')
+    
+    # 8. Find Max
+    max_vals, max_indices = torch.max(avg_win, dim=1)
+    is_valid_neuron = max_vals > -float('inf')
+    
+    # 9. Prepare Output
+    neuron_intensity_list = (max_vals - background_threshold).cpu().numpy()
+    neuron_indices_list = np.arange(N)
+    neuron_intensity_list[~is_valid_neuron.cpu().numpy()] = np.nan
     
     neuron_slices = {}
-    neuron_intensity_list = []
-    neuron_indices_list = []
-
-    for neuron_idx in range(neuron_pt_tuple.shape[0]):
-        neuron_data = neuron_pt_tuple[neuron_idx]
-        
-        x, y, z = neuron_data[0], neuron_data[1], neuron_data[2]
-        width, height = neuron_data[3], neuron_data[4]
-        depth = neuron_data[5] if len(neuron_data) > 5 else 2.0 
-        
-        # z and depth scaling
-        z /= 5.0 
-        depth = depth / 5.0
-
-        # 2. 获取边界框
-        bbox, valid = get_bounding_box_torch(
-            x, y, z, width, height, depth, 
-            vol_dims_y_x_z, device=device
-        )
-        if not valid:
+    max_indices_np = max_indices.cpu().numpy()
+    z_min_np = z_min.cpu().numpy()
+    depth_np = d_int.cpu().numpy()
+    
+    for i in range(N):
+        if not is_valid_neuron[i]:
             continue
-            
-        # convolution to calculate intensity (threshold ignored in impl; pass 0.0)
-        intensity, best_slices = calculate_intensity_conv_torch(
-            volume_3d, bbox,
-            0.0, background_threshold,
-            area_ratio=area_ratio,
-            device=device
-        )
-        
-        if not np.isnan(intensity):
-            neuron_intensity_list.append(intensity)
-            neuron_indices_list.append(neuron_idx)
-            neuron_slices[neuron_idx] = best_slices
+        idx = max_indices_np[i]
+        d = depth_np[i]
+        w_size = min(3, d)
+        start_z = z_min_np[i] + idx
+        slices = np.arange(start_z, start_z + w_size)
+        neuron_slices[i] = slices
 
-    return np.array(neuron_intensity_list), np.array(neuron_indices_list), neuron_slices
+    return neuron_intensity_list, neuron_indices_list, neuron_slices
