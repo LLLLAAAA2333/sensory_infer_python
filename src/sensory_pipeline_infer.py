@@ -144,6 +144,12 @@ def translation_matching_fft_with_dist(volume1_gpu, volume2_gpu, shiftrange=(21,
 def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
     if path not in cache:
         vol_data = np.load(path)
+        
+        # Filter out high intensity noise
+        if vol_data.max() >=10000:
+             print_warning_message(f"Found high intensity values (>= 10000) in {os.path.basename(path)}. Clamping to median.")
+             vol_data[vol_data >= 10000] = np.median(vol_data).astype(vol_data.dtype)
+
         vol_data = apply_zrange(vol_data, zrange)
         if vol_data.dtype == np.uint16:
             vol_data = vol_data.astype(np.float32)

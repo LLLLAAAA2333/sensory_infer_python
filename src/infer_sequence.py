@@ -189,6 +189,12 @@ def run_inference_on_volume_sequence(volume_dir, config_path, output_dir, **kwar
         current_neuron_pt_tuples = []
         current_neuron_pred_ids = []
         volume_np = np.load(volume_path)
+        
+        # Filter out high intensity noise
+        if volume_np.max() >= 10000:
+             print_warning_message(f"Found high intensity values (>= 10000) in {volume_basename}. Clamping to median.")
+             volume_np[volume_np >= 10000] = np.median(volume_np).astype(volume_np.dtype)
+
         volume_np = _apply_zrange(volume_np, (z_start, z_end))
         volume_tensor = torch.HalfTensor(volume_np.transpose(2, 0, 1)[:, np.newaxis, :, :].astype(np.float32)).cuda()
 
