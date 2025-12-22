@@ -118,7 +118,7 @@ def pixel_intensity_extraction(file_list, shift_list, neuron_pt_tuple, save_path
     return intensity_df
 
 # ---------------------------------new intensity extraction(convolution) ---------------------------------
-def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, background_threshold=0.0, device='cuda'):
+def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, background_threshold=0.0, device='cuda', median='none', depth_correction=1):
     """
     Extract per-neuron intensity using vectorized grid_sample and a sliding window to find the brightest contiguous Z segment.
 
@@ -128,6 +128,8 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
         area_ratio (float): Central ROI size ratio (ellipse inside bbox). Default 0.8.
         background_threshold (float): Value to subtract from final average intensity. Default 0.0.
         device (str): 'cuda' or 'cpu'.
+        median (str): 'none' to use all pixels, otherwise use median thresholding. Default 'none'.
+        depth_correction (int): add a correction factor to depth calculation. Default 1.
     """
     # 1. Prepare Volume
     if isinstance(volume, np.ndarray):
@@ -171,7 +173,7 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
     
     # Calculate integer Z bounds
     z_min = torch.ceil(z_center - depth / 2.0).int()
-    z_max = torch.ceil(z_center + depth / 2.0).int()
+    z_max = torch.ceil(z_center + depth / 2.0).int() + depth_correction
     
     d_int = z_max - z_min
     d_int = torch.clamp(d_int, min=1)
@@ -232,37 +234,43 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
     masked_samples = samples_flat[:, :, mask_flat] # (N, max_d, K)
     
     # 6. Compute Statistics per Slice
-    # Median
-    medians = torch.median(masked_samples, dim=-1).values # (N, max_d)
-    mask_above = masked_samples >= medians.unsqueeze(-1)
-    
-    sums_above = (masked_samples * mask_above).sum(dim=-1)
-    counts_above = mask_above.sum(dim=-1).float()
-    
     sums_all = masked_samples.sum(dim=-1)
     counts_all = torch.tensor(masked_samples.shape[-1], device=device, dtype=torch.float32)
-    
-    # Zero out invalid Z slices
-    sums_above = sums_above * valid_z_mask
-    counts_above = counts_above * valid_z_mask
     sums_all = sums_all * valid_z_mask
+
+    if median != 'none':
+        # Median
+        medians = torch.median(masked_samples, dim=-1).values # (N, max_d)
+        mask_above = masked_samples >= medians.unsqueeze(-1)
+        
+        sums_above = (masked_samples * mask_above).sum(dim=-1)
+        counts_above = mask_above.sum(dim=-1).float()
+        
+        # Zero out invalid Z slices
+        sums_above = sums_above * valid_z_mask
+        counts_above = counts_above * valid_z_mask
     
     # 7. Sliding Window (Kernel 3)
-    sums_above_padded = F.pad(sums_above.unsqueeze(1), (0, 2))
-    counts_above_padded = F.pad(counts_above.unsqueeze(1), (0, 2))
     sums_all_padded = F.pad(sums_all.unsqueeze(1), (0, 2))
     counts_all_padded = counts_all * F.pad(valid_z_mask.unsqueeze(1).float(), (0, 2))
     
     kernel = torch.ones((1, 1, 3), device=device)
     
-    sums_above_win = F.conv1d(sums_above_padded, kernel).squeeze(1)
-    counts_above_win = F.conv1d(counts_above_padded, kernel).squeeze(1)
     sums_all_win = F.conv1d(sums_all_padded, kernel).squeeze(1)
     counts_all_win = F.conv1d(counts_all_padded, kernel).squeeze(1)
     
-    avg_primary = sums_above_win / torch.clamp_min(counts_above_win, 1e-6)
-    avg_fallback = sums_all_win / torch.clamp_min(counts_all_win, 1e-6)
-    avg_win = torch.where(counts_above_win > 0, avg_primary, avg_fallback)
+    avg_all = sums_all_win / torch.clamp_min(counts_all_win, 1e-6)
+
+    if median != 'none':
+        sums_above_padded = F.pad(sums_above.unsqueeze(1), (0, 2))
+        counts_above_padded = F.pad(counts_above.unsqueeze(1), (0, 2))
+        sums_above_win = F.conv1d(sums_above_padded, kernel).squeeze(1)
+        counts_above_win = F.conv1d(counts_above_padded, kernel).squeeze(1)
+        
+        avg_primary = sums_above_win / torch.clamp_min(counts_above_win, 1e-6)
+        avg_win = torch.where(counts_above_win > 0, avg_primary, avg_all)
+    else:
+        avg_win = avg_all
     
     # Mask out invalid windows
     win_idx = torch.arange(max_d, device=device).unsqueeze(0)
