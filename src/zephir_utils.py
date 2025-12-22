@@ -44,7 +44,7 @@ def rescale_image(image, target_min, target_max, source_min=None, source_max=Non
     return np.clip((image_float32 - source_min) / (source_max - source_min) * (target_max - target_min) + target_min,
                              target_min, target_max).astype(image.dtype)
 
-def create_zephir_data(volume_input: VolumeInput, zephir_folder, zrange=None, max_depth: Optional[int] = None):
+def create_zephir_data(volume_input: VolumeInput, zephir_folder, zrange=None, max_depth: Optional[int] = None, denoise_range: Optional[Tuple[int, int]] = None):
     """
     Create ZephIR `data.h5` files from a volume source.
 
@@ -54,7 +54,6 @@ def create_zephir_data(volume_input: VolumeInput, zephir_folder, zrange=None, ma
     - a string path to a directory that contains `aligned_volumes_mip.npy` or a set
       of .npy files (this is to support the MIP workflow where aligned volumes
       and `neuron_pt_tuple.npy` are saved together in one folder).
-
     Returns (num_volumes, shape) where shape is (Z, Y, X).
     """
     os.makedirs(zephir_folder, exist_ok=True)
@@ -119,6 +118,9 @@ def create_zephir_data(volume_input: VolumeInput, zephir_folder, zrange=None, ma
 
             # vol is (Y, X, Z) -> transpose to (Z, Y, X)
             vol = np.transpose(vol, (2, 0, 1))
+
+            if denoise_range:
+                vol[(vol < denoise_range[0]) | (vol > denoise_range[1])] = 0
 
             vol_scaled = rescale_image(vol, 0, 255).astype(np.uint8)
             ds[i, 0] = vol_scaled
@@ -210,6 +212,7 @@ def convert_npy_to_ZephIR_format(
     zrange: Optional[Tuple[int, int]] = None,
     z_ratio: float = 5.0,
     max_depth: Optional[int] = 20,
+    denoise_range: Optional[Tuple[int, int]] = None,
 ):
     """Convert numpy volumes and neuron coordinates into ZephIR chunked datasets."""
 
@@ -229,6 +232,7 @@ def convert_npy_to_ZephIR_format(
         zephir_folder,
         zrange=zrange,
         max_depth=max_depth,
+        denoise_range=denoise_range,
     )
     create_zephir_annotations(
         neuron_pt_tuple,

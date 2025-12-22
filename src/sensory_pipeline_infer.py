@@ -34,7 +34,7 @@ def _compute_z_ratio(config_dict):
     return 5.0
 
 
-def export_volumes_to_zephir(volume_source, neuron_pt_tuple_source, zephir_path, z_ratio, zrange, max_depth=20):
+def export_volumes_to_zephir(volume_source, neuron_pt_tuple_source, zephir_path, z_ratio, zrange, max_depth=20, denoise_range=(102, 1000)):
     os.makedirs(zephir_path, exist_ok=True)
     print_info_message(f"Converting inference outputs to ZephIR format at {zephir_path}...")
     zephir_utils.convert_npy_to_ZephIR_format(
@@ -44,6 +44,7 @@ def export_volumes_to_zephir(volume_source, neuron_pt_tuple_source, zephir_path,
         zrange=zrange,
         z_ratio=z_ratio,
         max_depth=max_depth,
+        denoise_range=denoise_range,
     )
     print_info_message(f"ZephIR data saved to {zephir_path}")
 
