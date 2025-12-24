@@ -118,7 +118,7 @@ def pixel_intensity_extraction(file_list, shift_list, neuron_pt_tuple, save_path
     return intensity_df
 
 # ---------------------------------new intensity extraction(convolution) ---------------------------------
-def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, background_threshold=0.0, device='cuda', median='none', depth_correction=1):
+def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, background_threshold=0.0, device='cuda', use_median=True, depth_correction=1):
     """
     Extract per-neuron intensity using vectorized grid_sample and a sliding window to find the brightest contiguous Z segment.
 
@@ -128,7 +128,7 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
         area_ratio (float): Central ROI size ratio (ellipse inside bbox). Default 0.8.
         background_threshold (float): Value to subtract from final average intensity. Default 0.0.
         device (str): 'cuda' or 'cpu'.
-        median (str): 'none' to use all pixels, otherwise use median thresholding. Default 'none'.
+        use_median (bool): False to use all pixels, True to use median thresholding. Default False.
         depth_correction (int): add a correction factor to depth calculation. Default 1.
     """
     # 1. Prepare Volume
@@ -238,7 +238,7 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
     counts_all = torch.tensor(masked_samples.shape[-1], device=device, dtype=torch.float32)
     sums_all = sums_all * valid_z_mask
 
-    if median != 'none':
+    if use_median:
         # Median
         medians = torch.median(masked_samples, dim=-1).values # (N, max_d)
         mask_above = masked_samples >= medians.unsqueeze(-1)
@@ -261,7 +261,7 @@ def extract_neuron_intensities_torch(volume, neuron_pt_tuple, area_ratio=0.8, ba
     
     avg_all = sums_all_win / torch.clamp_min(counts_all_win, 1e-6)
 
-    if median != 'none':
+    if use_median:
         sums_above_padded = F.pad(sums_above.unsqueeze(1), (0, 2))
         counts_above_padded = F.pad(counts_above.unsqueeze(1), (0, 2))
         sums_above_win = F.conv1d(sums_above_padded, kernel).squeeze(1)
