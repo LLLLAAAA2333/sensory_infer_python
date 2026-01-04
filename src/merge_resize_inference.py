@@ -296,7 +296,7 @@ def filter_regions_by_scores(scores, cur_num_region):
 
 def refresh_variables_region(regions, region_ptrs, mask):
     new_regions = dict()
-    cur_region_ptrs = torch.LongTensor(region_ptrs)[mask]
+    cur_region_ptrs = torch.tensor(region_ptrs, device=mask.device, dtype=torch.long)[mask]
     for frame_idx in regions.keys():
         frame_ptrs = cur_region_ptrs[cur_region_ptrs[:, 0] == frame_idx, :][:, 1]
         if len(frame_ptrs) > 0:
