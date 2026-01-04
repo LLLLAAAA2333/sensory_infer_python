@@ -1,0 +1,43 @@
+[workspace]
+authors = ["JH Wang <1125623896@qq.com>"]
+channels = ["pytorch", "nvidia","conda-forge"]
+name = "sensory_infer_python"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "3.11.*"
+numpy = "*"
+pandas = "*"
+h5py = "*"
+tqdm = "*"
+scipy = "*"
+matplotlib = "*"
+ipykernel = "*"
+pyyaml = "*"
+seaborn = "*"
+scikit-learn = "*"
+pillow = "*"
+onnx = "*"
+pytorch-lightning = "*"
+torchmetrics = "*"
+tensorboard = ">=2.20.0,<3"
+
+[target.linux-64.dependencies]
+pytorch = "*"
+torchvision = "*"
+torchaudio = "*"
+pytorch-cuda = "11.8.*" 
+
+[pypi-dependencies]
+opencv-python = ">=4.11.0.86, <5"
+albumentations = "*"
+bbox-visualizer = "*"
+lion-pytorch = "*"
+finetuning-scheduler = "*"
+mat73 = "*"
+thop = "*"
+onnx-simplifier = "*"
+onnxruntime = ">=1.23.2, <2"

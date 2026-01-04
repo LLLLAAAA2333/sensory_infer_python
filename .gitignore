@@ -208,3 +208,6 @@ __marimo__/
 
 # debug
 debug/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
