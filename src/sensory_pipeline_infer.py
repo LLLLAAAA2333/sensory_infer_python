@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import json
 import re
 import argparse
@@ -229,6 +230,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
         segment_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
         if current_mode == 'dual_propagate':
             print_log_message(f"Running dual propagation for segment {t} ({num_ex_vols} frames)...")
+            t_start_align = time.time()
 
             print_log_message(f"  Aligning ref_A to ex_vol_0...")
             vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device, zrange=zrange)
@@ -287,6 +289,9 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 only_b = ~f_valid & b_valid
                 blended_coords[only_b] = b_coords[only_b]
                 segment_coords[k] = blended_coords
+            
+            t_end_align = time.time()
+            print_log_message(f"Alignment (dual_propagate) for segment {t} took {t_end_align - t_start_align:.4f}s")
 
 
         for k, ex_file_path in enumerate(ex_files):
@@ -300,6 +305,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 interp_pt_tuple[:, coord_features] = interp_coords
 
             elif current_mode == 'align':
+                t_start_align = time.time()
                 ex_vol_k_data = np.load(ex_file_path)
                 ex_vol_k_data = apply_zrange(ex_vol_k_data, zrange)
                 if ex_vol_k_data.dtype == np.uint16:
@@ -309,6 +315,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 # align with ref volumes
                 shift_A, dist_A = matching_func(ref_A_vol_gpu, ex_vol_k_gpu, shiftrange, device)
                 shift_B, dist_B = matching_func(ref_B_vol_gpu, ex_vol_k_gpu, shiftrange, device)
+                t_end_align = time.time()
+                print_log_message(f"Alignment (align mode) for frame {k} took {t_end_align - t_start_align:.4f}s")
                 coords_A = ref_start_coords.copy()
                 coords_B = ref_end_coords.copy()
 
@@ -371,6 +379,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             ex_vol_data = np.load(ex_file_path)
             ex_vol_data = apply_zrange(ex_vol_data, zrange)
 
+            t_start_extract = time.time()
             intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
                 ex_vol_data,
                 valid_interp_tuple,
@@ -378,6 +387,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 background_threshold=0,
                 device=device,
             )
+            t_end_extract = time.time()
+            print_log_message(f"Extraction for frame {k} took {t_end_extract - t_start_extract:.4f}s")
             if isinstance(intensity_values, torch.Tensor):
                 intensity_values = intensity_values.detach().cpu().numpy()
             if isinstance(intensity_indices, torch.Tensor):
