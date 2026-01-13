@@ -101,11 +101,13 @@ def translation_matching_bruteforce_with_dist(volume1_gpu, volume2_gpu, shiftran
         (Y, X, Z) format GPU Tensors.
         Return (row_shift, col_shift) and min_distance.
     """
+    t0 = time.time()
     binary_volume1_mask = pixel_threshold(volume1_gpu)
     binary_volume2_mask = pixel_threshold(volume2_gpu)
 
     binary_image1 = get_image4processing(binary_volume1_mask).to(torch.int)
     binary_image2 = get_image4processing(binary_volume2_mask).to(torch.int)
+    t1 = time.time()
 
     if binary_image1.shape != binary_image2.shape:
         print_warning_message(f"MIP shape mismatch {binary_image1.shape} vs {binary_image2.shape}. Skipping alignment.")
@@ -113,10 +115,15 @@ def translation_matching_bruteforce_with_dist(volume1_gpu, volume2_gpu, shiftran
 
     rows, cols = binary_image2.shape
     distance_matrix = compute_distance(binary_image1, binary_image2, rows, cols, shiftrange)
+    t2 = time.time()
+    
     min_distance, min_idx = torch.min(distance_matrix.view(-1), 0)
     min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
 
     shift_yx = (min_distance_index[0] - shiftrange[0] // 2, min_distance_index[1] - shiftrange[1] // 2)
+    t3 = time.time()
+    
+    # print_log_message(f"[BruteForce] Preproc: {t1-t0:.4f}s, Dist: {t2-t1:.4f}s, Post: {t3-t2:.4f}s")
     return shift_yx, min_distance.item()
 
 def translation_matching_fft_with_dist(volume1_gpu, volume2_gpu, shiftrange=(21, 21), device='cuda'):
@@ -125,11 +132,14 @@ def translation_matching_fft_with_dist(volume1_gpu, volume2_gpu, shiftrange=(21,
         (Y, X, Z) format GPU Tensors.
         Return (row_shift, col_shift) and min_distance.
     """
+
+    t0 = time.time()
     binary_volume1_mask = pixel_threshold(volume1_gpu)
     binary_volume2_mask = pixel_threshold(volume2_gpu)
 
     binary_image1 = get_image4processing(binary_volume1_mask).to(torch.int)
     binary_image2 = get_image4processing(binary_volume2_mask).to(torch.int)
+    t1 = time.time()
 
     if binary_image1.shape != binary_image2.shape:
         print_warning_message(f"MIP shape mismatch {binary_image1.shape} vs {binary_image2.shape}. Skipping alignment.")
@@ -137,10 +147,15 @@ def translation_matching_fft_with_dist(volume1_gpu, volume2_gpu, shiftrange=(21,
 
     rows, cols = binary_image2.shape
     distance_matrix = compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange)
+    t2 = time.time()
+    
     min_distance, min_idx = torch.min(distance_matrix.reshape(-1), 0)
     min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
 
     shift_yx = (min_distance_index[0] - shiftrange[0] // 2, min_distance_index[1] - shiftrange[1] // 2)
+    t3 = time.time()
+    
+    print_log_message(f"[FFT] Preproc: {t1-t0:.4f}s, Dist: {t2-t1:.4f}s, Post: {t3-t2:.4f}s")
     return shift_yx, min_distance.item()
 
 def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
@@ -305,13 +320,13 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 interp_pt_tuple[:, coord_features] = interp_coords
 
             elif current_mode == 'align':
-                t_start_align = time.time()
                 ex_vol_k_data = np.load(ex_file_path)
                 ex_vol_k_data = apply_zrange(ex_vol_k_data, zrange)
                 if ex_vol_k_data.dtype == np.uint16:
                     ex_vol_k_data = ex_vol_k_data.astype(np.float32)
                 ex_vol_k_gpu = torch.from_numpy(ex_vol_k_data).to(device).float()
                 
+                t_start_align = time.time()
                 # align with ref volumes
                 shift_A, dist_A = matching_func(ref_A_vol_gpu, ex_vol_k_gpu, shiftrange, device)
                 shift_B, dist_B = matching_func(ref_B_vol_gpu, ex_vol_k_gpu, shiftrange, device)
