@@ -795,8 +795,7 @@ if __name__ == '__main__':
             pre_resize_size=args.pre_resize_size,
             pre_rescale_pixels=args.pre_rescale_pixels,
             shiftrange=shiftrange,
-            align_method=args.align_method,
-            device=device
+            align_method=args.align_method
         )
         print_info_message("MIP mode processing finished.")
         
