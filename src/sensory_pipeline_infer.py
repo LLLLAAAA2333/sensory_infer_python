@@ -106,14 +106,6 @@ def translation_matching_bruteforce_with_dist(binary_image1, binary_image2, shif
         (Y, X, Z) format GPU Tensors.
         Return (row_shift, col_shift) and min_distance.
     """
-    # t0 = time.time()
-    # binary_volume1_mask = pixel_threshold(volume1_gpu)
-    # binary_volume2_mask = pixel_threshold(volume2_gpu)
-
-    # binary_image1 = get_image4processing(binary_volume1_mask).to(torch.int)
-    # binary_image2 = get_image4processing(binary_volume2_mask).to(torch.int)
-    # t1 = time.time()
-    
     t1 = time.time() # Start timing here since preprocessing is done outside
 
     if binary_image1.shape != binary_image2.shape:
@@ -140,12 +132,6 @@ def translation_matching_fft_with_dist(binary_image1, binary_image2, shiftrange=
         Return (row_shift, col_shift) and min_distance.
     """
 
-    t0 = time.time()
-    binary_volume1_mask = pixel_threshold(volume1_gpu)
-    binary_volume2_mask = pixel_threshold(volume2_gpu)
-
-    binary_image1 = get_image4processing(binary_volume1_mask).to(torch.int)
-    binary_image2 = get_image4processing(binary_volume2_mask).to(torch.int)
     t1 = time.time()
 
     if binary_image1.shape != binary_image2.shape:
