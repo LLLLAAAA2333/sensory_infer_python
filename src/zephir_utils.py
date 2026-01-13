@@ -150,6 +150,7 @@ def create_zephir_annotations(neuron_pt_tuple, zephir_folder, shape, z_ratio=5.0
         ds_worldline = f.create_dataset('/worldline_id', shape=(0,), maxshape=max_shape, dtype='uint16')
         ds_prov = f.create_dataset('/provenance', shape=(0,), maxshape=max_shape, dtype='S4')
         ds_t = f.create_dataset('/t_idx', shape=(0,), maxshape=max_shape, dtype='uint32')
+        ds_abs_t_idx = f.create_dataset('/abs_t_idx', shape=(0,), maxshape=max_shape, dtype='uint32')
         
         current_offset = 0
         
@@ -176,7 +177,7 @@ def create_zephir_annotations(neuron_pt_tuple, zephir_folder, shape, z_ratio=5.0
             ds_worldline.resize((current_offset + n_points,))
             ds_prov.resize((current_offset + n_points,))
             ds_t.resize((current_offset + n_points,))
-            
+            ds_abs_t_idx.resize((current_offset + n_points,))
             ds_x[current_offset:] = x / width
             ds_y[current_offset:] = y / height
             ds_z[current_offset:] = z / (z_ratio * depth)
