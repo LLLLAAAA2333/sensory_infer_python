@@ -116,6 +116,12 @@ def automatic_foreground_process(volume, gaussian_k: int = 9, maxpool_k: int = 1
             raise e
     # noise_mean = volume[~mask].mean()
     volume[~mask] = 0.
+    if not mask.any():
+        print_warning_message("No foreground pixels detected via thresholding. Skipping normalization.")
+        if only_scale:
+            return raw
+        else:
+            return volume
     # TODO: delete debug info
     # print_log_message(f" \n Threshold: {threshold}， FG / whole: {mask.float().sum() / volume.numel() * 100 :.3f} %， "
     #                   f"Background mean: {noise_mean}, Foreground mean: {volume[mask].mean()}")
