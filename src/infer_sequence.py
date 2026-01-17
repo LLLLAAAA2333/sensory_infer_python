@@ -260,7 +260,7 @@ def run_inference_on_volume_sequence(volume_dir, config_path, output_dir, **kwar
     all_ids = set()
     for pt_tuple, pred_ids in temporal_results:
         all_ids.update(pred_ids)
-        if pt_tuple.ndim == 2 and pt_tuple.shape[1] > 0: # 确保至少有一个有效的 pt_tuple 来确定特征数
+        if pt_tuple.ndim == 2 and pt_tuple.shape[1] > 0:
                             num_features = pt_tuple.shape[1] # F=8
     if not all_ids:
         print_warning_message("No neurons detected in the entire sequence.")
