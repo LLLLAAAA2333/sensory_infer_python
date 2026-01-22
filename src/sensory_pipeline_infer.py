@@ -11,7 +11,7 @@ from glob import glob
 from tqdm import tqdm
 import torch
 from torch.nn import functional as F
-import vis_trajectory as vis
+import src.plot_result.vis_trajectory as vis
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 
 from src.infer_sequence import run_inference_on_volume_sequence
@@ -21,7 +21,7 @@ from src.inference.blur import get_image4processing, pixel_threshold
 from src.inference.intensity_extract import extract_neuron_intensities_torch
 from src.merge_resize_inference import Treeformer_End2End
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
-from src import zephir_utils
+from src.zephir import zephir_utils
 
 
 def _compute_z_ratio(config_dict):
