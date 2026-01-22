@@ -57,7 +57,7 @@ def clamp_neuron_depth(array, depth_limit=20):
         raise ValueError("depth_limit must be positive")
     if array.ndim < 2 or array.shape[-1] < 6:
         return array
-    np.clip(array[..., 5], 0, depth_limit - 1, out=array[..., 5])
+    np.clip(array[..., 5], 10, depth_limit, out=array[..., 5])
     return array
 
 
@@ -706,6 +706,102 @@ def generate_experiment_volume_video(
         trace_length=0,
     ).save_all(save_dir, total_frames, fps)
 
+def extract_intensities_only(
+    ex_vol_folders,
+    ex_neuron_pt_tuple,
+    output_dir,
+    device='cuda',
+    zrange=None
+):
+    """
+    Extract intensities using existing coordinates (ex_neuron_pt_tuple).
+    Skips alignment.
+    """
+    ex_folder_files = [load_datapath(folder) for folder in ex_vol_folders]
+    ex_seg_counts = np.array([len(files) for files in ex_folder_files], dtype=np.int32)
+    ex_files = []
+    for files in ex_folder_files:
+        ex_files.extend(files)
+    
+    num_ex_vols = len(ex_files)
+    num_coords_frames, N_neurons, _ = ex_neuron_pt_tuple.shape
+    
+    if num_ex_vols != num_coords_frames:
+        print_warning_message(f"Frame count mismatch: {num_ex_vols} volumes vs {num_coords_frames} coordinate frames. Using minimum.")
+    
+    num_frames = min(num_ex_vols, num_coords_frames)
+    all_intensities_list = []
+    
+    print_log_message(f"Starting intensity extraction for {num_frames} volumes using existing coordinates...")
+
+    for k in tqdm(range(num_frames), desc="Extracting intensities (only-extract mode)"):
+        ex_file_path = ex_files[k]
+        coords = ex_neuron_pt_tuple[k]
+        
+        ex_vol_data = np.load(ex_file_path)
+        ex_vol_data = apply_zrange(ex_vol_data, zrange)
+        
+        final_valid_mask = ~np.isnan(coords[:, 0])
+        valid_interp_tuple = coords[final_valid_mask]
+        
+        intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
+            ex_vol_data,
+            valid_interp_tuple,
+            area_ratio=0.8,
+            background_threshold=0,
+            device=device,
+        )
+        
+        if isinstance(intensity_values, torch.Tensor):
+            intensity_values = intensity_values.detach().cpu().numpy()
+        if isinstance(intensity_indices, torch.Tensor):
+            intensity_indices = intensity_indices.detach().cpu().numpy()
+            
+        intensity_values = np.asarray(intensity_values)
+        intensity_indices = np.asarray(intensity_indices)
+        
+        if intensity_indices.size == 0:
+            all_intensities_list.append(pd.Series(np.nan, index=range(N_neurons)))
+            continue
+
+        if intensity_indices.dtype != np.int64 and intensity_indices.dtype != np.int32 and intensity_indices.dtype != np.bool_:
+            intensity_indices = intensity_indices.astype(np.int64)
+
+        valid_count = int(np.sum(final_valid_mask))
+        if intensity_indices.dtype != np.bool_:
+            in_range = (intensity_indices >= 0) & (intensity_indices < valid_count)
+            intensity_indices = intensity_indices[in_range]
+            intensity_values = intensity_values[in_range]
+
+        vol_intensity = pd.Series(np.nan, index=range(N_neurons))
+        original_indices = np.where(final_valid_mask)[0][intensity_indices]
+        vol_intensity.iloc[original_indices] = intensity_values
+        all_intensities_list.append(vol_intensity)
+
+    if all_intensities_list:
+        all_intensities_df = pd.concat(all_intensities_list, axis=1)
+        all_intensities_df.columns = range(len(all_intensities_list))
+    else:
+        all_intensities_df = pd.DataFrame(index=range(N_neurons))
+
+    output_csv_path = os.path.join(output_dir, "neuron_intensities_extracted.csv")
+    all_intensities_df.to_csv(output_csv_path, index_label="neuron_index")
+    
+    match = re.search(r'w(\d+)', output_dir)
+    if match:
+        prefix = match.group(0)  
+        file_name = prefix + '_trace.h5'
+        file_path = os.path.join(output_dir, file_name)
+    else:
+        file_path = os.path.join(output_dir, 'trace.h5')
+    
+    with h5py.File(file_path, 'w') as h5f:
+        h5f.create_dataset('intensity', data=all_intensities_df.values)
+        h5f.create_dataset('n_seg', data=ex_seg_counts.astype(np.int64))
+    print_log_message(f"Saved extracted intensities to {output_csv_path} and {file_path}.")
+
+    return all_intensities_df
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Extracts neuronal intensity from experimental volumes by interpolating coordinates from reference volumes.")
     
@@ -734,6 +830,8 @@ if __name__ == '__main__':
                         help="Local search range (Rows,Cols) for 'align' or 'dual_propagate' mode, e.g., '21,21' for +/- 10 pixels.")
     parser.add_argument('--align-method', type=str, choices=['bruteforce', 'fft'], default='bruteforce',
                         help="Method for alignment: 'bruteforce' (exhaustive search) or 'fft' (fast fourier transform).")
+    
+    parser.add_argument('--only-extract-intensity', action='store_true', help="Skip alignment and reuse existing ex_neuron_pt_tuple.npy for intensity extraction.")
 
     parser.set_defaults(skip_inference=False)
 
@@ -789,68 +887,85 @@ if __name__ == '__main__':
             print_info_message("ZephIR export finished. Stopping pipeline as requested.")
             sys.exit(0)
     else:
-        if not args.ref_volumes_dir:
-            raise ValueError("'--ref-volumes-dir' is required for non-mip processing modes.")
-
-        print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
-        ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
-        os.makedirs(ref_inference_output_dir, exist_ok=True)
-        if args.skip_inference:
-            print_info_message("Skipping reference inference; expecting existing ref_neuron_pt_tuple_filled.npy.")
-        else:
-            run_inference_on_volume_sequence(
-                volume_dir=args.ref_volumes_dir,
-                config_path=args.config,
-                output_dir=ref_inference_output_dir,
-                json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
-                zrange=config_zrange,
-                pre_resize=args.pre_resize,
-                pre_resize_size=args.pre_resize_size,
-                pre_rescale_pixels=args.pre_rescale_pixels
-            )
-            print_log_message("Phase 1: Reference inference complete.")
-
-        filled_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple_filled.npy")
-        raw_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple.npy")
-        for candidate in (filled_path, raw_path):
-            clamp_neuron_depth_file(candidate, args.neuron_depth_limit)
-
-        print_info_message(f"--- Phase 2: Starting {args.processing_mode} and intensity extraction ---")
-        ref_coords_path = filled_path if os.path.exists(filled_path) else raw_path
-        if not os.path.exists(ref_coords_path):
-            raise FileNotFoundError("Could not find 'ref_neuron_pt_tuple_filled.npy' or 'ref_neuron_pt_tuple.npy'. Phase 1 may have failed.")
-        elif ref_coords_path == raw_path:
-            print_warning_message("Using non-interpolated reference coordinates ('ref_neuron_pt_tuple.npy').")
-
-        ref_coords = np.load(ref_coords_path)
-        clamp_neuron_depth(ref_coords, args.neuron_depth_limit)
-
-        if args.transfer_zephir_path:
-            export_volumes_to_zephir(
-                args.ref_volumes_dir,
-                ref_coords_path,
-                args.transfer_zephir_path,
-                z_ratio=config_zratio,
-                zrange=config_zrange,
-                max_depth=args.neuron_depth_limit,
-            )
-            print_info_message("ZephIR conversion complete; skipping experimental intensity extraction.")
-            print_info_message("ZephIR export finished. Stopping pipeline as requested.")
-            sys.exit(0)
-        else:
-            ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
-            ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
-                ref_coords,
+        if args.only_extract_intensity:
+            print_info_message("--- Only Extract Intensity Mode ---")
+            ex_coords_path = os.path.join(args.output_dir, "ex_neuron_pt_tuple.npy")
+            if not os.path.exists(ex_coords_path):
+                raise FileNotFoundError(f"Could not find {ex_coords_path} required for --only-extract-intensity mode.")
+            
+            print_log_message(f"Loading coordinates from {ex_coords_path}")
+            ex_neuron_pt_tuple = np.load(ex_coords_path)
+            
+            all_intensities_df = extract_intensities_only(
                 ex_vol_folders,
-                ref_vol_paths,
+                ex_neuron_pt_tuple,
                 args.output_dir,
-                mode=args.processing_mode,
                 device=device,
-                shiftrange=shiftrange,
-                zrange=config_zrange,
-                align_method=args.align_method,
+                zrange=config_zrange
             )
-            print_info_message("Processing finished.")
+        else:
+            if not args.ref_volumes_dir:
+                raise ValueError("'--ref-volumes-dir' is required for non-mip processing modes.")
+
+            print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
+            ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
+            os.makedirs(ref_inference_output_dir, exist_ok=True)
+            if args.skip_inference:
+                print_info_message("Skipping reference inference; expecting existing ref_neuron_pt_tuple_filled.npy.")
+            else:
+                run_inference_on_volume_sequence(
+                    volume_dir=args.ref_volumes_dir,
+                    config_path=args.config,
+                    output_dir=ref_inference_output_dir,
+                    json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
+                    zrange=config_zrange,
+                    pre_resize=args.pre_resize,
+                    pre_resize_size=args.pre_resize_size,
+                    pre_rescale_pixels=args.pre_rescale_pixels
+                )
+                print_log_message("Phase 1: Reference inference complete.")
+
+            filled_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple_filled.npy")
+            raw_path = os.path.join(ref_inference_output_dir, "ref_neuron_pt_tuple.npy")
+            for candidate in (filled_path, raw_path):
+                clamp_neuron_depth_file(candidate, args.neuron_depth_limit)
+
+            print_info_message(f"--- Phase 2: Starting {args.processing_mode} and intensity extraction ---")
+            ref_coords_path = filled_path if os.path.exists(filled_path) else raw_path
+            if not os.path.exists(ref_coords_path):
+                raise FileNotFoundError("Could not find 'ref_neuron_pt_tuple_filled.npy' or 'ref_neuron_pt_tuple.npy'. Phase 1 may have failed.")
+            elif ref_coords_path == raw_path:
+                print_warning_message("Using non-interpolated reference coordinates ('ref_neuron_pt_tuple.npy').")
+
+            ref_coords = np.load(ref_coords_path)
+            clamp_neuron_depth(ref_coords, args.neuron_depth_limit)
+
+            if args.transfer_zephir_path:
+                export_volumes_to_zephir(
+                    args.ref_volumes_dir,
+                    ref_coords_path,
+                    args.transfer_zephir_path,
+                    z_ratio=config_zratio,
+                    zrange=config_zrange,
+                    max_depth=args.neuron_depth_limit,
+                )
+                print_info_message("ZephIR conversion complete; skipping experimental intensity extraction.")
+                print_info_message("ZephIR export finished. Stopping pipeline as requested.")
+                sys.exit(0)
+            else:
+                ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
+                ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
+                    ref_coords,
+                    ex_vol_folders,
+                    ref_vol_paths,
+                    args.output_dir,
+                    mode=args.processing_mode,
+                    device=device,
+                    shiftrange=shiftrange,
+                    zrange=config_zrange,
+                    align_method=args.align_method,
+                )
+                print_info_message("Processing finished.")
 
     print_info_message("--- Phase 3: Generating experimental volume video ---")
 
