@@ -15,7 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 
 from src.infer_sequence import run_inference_on_volume_sequence
 from src.infer_single import run_inference_on_single_volume
-from src.inference.volume_alignment import compute_distance, volume_alignment, compute_distance_fft
+from src.inference.volume_alignment import compute_distance, volume_alignment, compute_distance_fft, compute_3d_shift
 from src.inference.blur import get_image4processing, pixel_threshold
 from src.inference.intensity_extract import extract_neuron_intensities_torch
 from src.merge_resize_inference import Treeformer_End2End
@@ -167,7 +167,7 @@ def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
     return cache[path]
 
 def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_dir,
-                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None, align_method='bruteforce'):
+                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None, align_method='bruteforce', z_ratio=1.0):
     """
     Args:
         ref_coords: numpy array of shape (T_ref, N_neurons, F_features)
@@ -234,11 +234,6 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             if ref_A_vol_gpu is None or ref_B_vol_gpu is None:
                 print_warning_message(f"Segment {t}: Failed to load ref vols, falling back to 'interpolate'.")
                 current_mode = 'interpolate'
-            
-            if current_mode != 'interpolate':
-                # Preprocess Ref Images Once
-                ref_A_img = preprocess_for_alignment(ref_A_vol_gpu)
-                ref_B_img = preprocess_for_alignment(ref_B_vol_gpu)
 
         segment_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
         if current_mode == 'dual_propagate':
@@ -247,11 +242,11 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             print_log_message(f"  Aligning ref_A to ex_vol_0...")
             vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device, zrange=zrange)
-            img_k_minus_1 = preprocess_for_alignment(vol_k_minus_1_gpu)
             
-            shift_yx, dist = matching_func(ref_A_img, img_k_minus_1, shiftrange, device)
+            shift_xyz, dist = compute_3d_shift(ref_A_vol_gpu, vol_k_minus_1_gpu, matching_func, shiftrange, z_ratio, device)
             current_f_coords = ref_start_coords.copy()
-            shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_f_coords.dtype)
+            # shift_xyz is [dx, dy, dz]. Coords are [x, y, z].
+            shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_f_coords.dtype)
             current_f_coords[:, :3] -= shift_vector
 
             forward_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
@@ -259,37 +254,35 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
             for k in range(1, num_ex_vols):
                 vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
-                img_k = preprocess_for_alignment(vol_k_gpu)
 
-                shift_yx, dist = matching_func(img_k_minus_1, img_k, shiftrange, device)
-                shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_f_coords.dtype)
+                shift_xyz, dist = compute_3d_shift(vol_k_minus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device)
+                shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_f_coords.dtype)
                 current_f_coords[:, :3] -= shift_vector
                 forward_coords[k] = current_f_coords.copy()
                 vol_k_minus_1_gpu = vol_k_gpu
-                img_k_minus_1 = img_k
 
             del vol_k_gpu, vol_k_minus_1_gpu
 
             print_log_message(f"  Aligning ref_B to ex_vol_{num_ex_vols - 1}...")
             vol_k_plus_1_gpu = load_ex_vol_gpu(ex_files[-1], {}, device, zrange=zrange)
-            img_k_plus_1 = preprocess_for_alignment(vol_k_plus_1_gpu)
-            shift_yx, dist = matching_func(ref_B_img, img_k_plus_1, shiftrange, device)
+            # vol_k_plus_1 matched against ref_B
+            # matching_func(ref_B, vol_k_plus_1) -> shift of vol_k_plus_1 relative to ref_B
+            shift_xyz, dist = compute_3d_shift(ref_B_vol_gpu, vol_k_plus_1_gpu, matching_func, shiftrange, z_ratio, device)
 
             current_b_coords = ref_end_coords.copy()
-            shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_b_coords.dtype)
+            shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_b_coords.dtype)
             current_b_coords[:, :3] -= shift_vector
             backward_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
             backward_coords[-1] = current_b_coords.copy()
 
             for k in range(num_ex_vols - 2, -1, -1):
                 vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
-                img_k = preprocess_for_alignment(vol_k_gpu)
-                shift_yx, dist = matching_func(img_k_plus_1, img_k, shiftrange, device)
-                shift_vector = np.array([shift_yx[1], shift_yx[0], 0], dtype=current_b_coords.dtype)
+                # Align vol_k against vol_k_plus_1
+                shift_xyz, dist = compute_3d_shift(vol_k_plus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device)
+                shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_b_coords.dtype)
                 current_b_coords[:, :3] -= shift_vector
                 backward_coords[k] = current_b_coords.copy()
                 vol_k_plus_1_gpu = vol_k_gpu
-                img_k_plus_1 = img_k
             
             del vol_k_gpu, vol_k_plus_1_gpu
             torch.cuda.empty_cache()
@@ -333,19 +326,18 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 ex_vol_k_gpu = torch.from_numpy(ex_vol_k_data).to(device).float()
                 
                 t_start_align = time.time()
-                # align with ref volumes
-                ex_vol_k_img = preprocess_for_alignment(ex_vol_k_gpu)
-                shift_A, dist_A = matching_func(ref_A_img, ex_vol_k_img, shiftrange, device)
-                shift_B, dist_B = matching_func(ref_B_img, ex_vol_k_img, shiftrange, device)
+                # align with ref volumes (3D)
+                shift_A_xyz, dist_A = compute_3d_shift(ref_A_vol_gpu, ex_vol_k_gpu, matching_func, shiftrange, z_ratio, device)
+                shift_B_xyz, dist_B = compute_3d_shift(ref_B_vol_gpu, ex_vol_k_gpu, matching_func, shiftrange, z_ratio, device)
                 t_end_align = time.time()
                 print_log_message(f"Alignment (align mode) for frame {k} took {t_end_align - t_start_align:.4f}s")
                 coords_A = ref_start_coords.copy()
                 coords_B = ref_end_coords.copy()
 
-                shift_vec_A = np.array([shift_A[1], shift_A[0], 0], dtype=coords_A.dtype)
+                shift_vec_A = np.array([shift_A_xyz[0], shift_A_xyz[1], shift_A_xyz[2]], dtype=coords_A.dtype)
                 coords_A[:, :3] -= shift_vec_A
 
-                shift_vec_B = np.array([shift_B[1], shift_B[0], 0], dtype=coords_B.dtype)
+                shift_vec_B = np.array([shift_B_xyz[0], shift_B_xyz[1], shift_B_xyz[2]], dtype=coords_B.dtype)
                 coords_B[:, :3] -= shift_vec_B
 
                 # dists = np.array([dist_A, dist_B], dtype=np.float64)
@@ -827,7 +819,7 @@ if __name__ == '__main__':
     parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate', 'mip'], 
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
-                        help="Local search range (Rows,Cols) for 'align' or 'dual_propagate' mode, e.g., '21,21' for +/- 10 pixels.")
+                        help="Local search range (Rows,Cols) or (Rows,Cols,Slices) for 'align' or 'dual_propagate' mode, e.g., '21,21' or '21,21,11'.")
     parser.add_argument('--align-method', type=str, choices=['bruteforce', 'fft'], default='bruteforce',
                         help="Method for alignment: 'bruteforce' (exhaustive search) or 'fft' (fast fourier transform).")
     
@@ -855,7 +847,7 @@ if __name__ == '__main__':
 
     try:
         shiftrange = tuple(map(int, args.align_shiftrange.split(',')))
-        if len(shiftrange) != 2: raise ValueError
+        if len(shiftrange) not in (2, 3): raise ValueError
     except ValueError:
         print_warning_message(f"Invalid shiftrange '{args.align_shiftrange}'. Using default (21,21).")
         shiftrange = (21, 21)
@@ -940,32 +932,33 @@ if __name__ == '__main__':
             ref_coords = np.load(ref_coords_path)
             clamp_neuron_depth(ref_coords, args.neuron_depth_limit)
 
-            if args.transfer_zephir_path:
-                export_volumes_to_zephir(
-                    args.ref_volumes_dir,
-                    ref_coords_path,
-                    args.transfer_zephir_path,
-                    z_ratio=config_zratio,
-                    zrange=config_zrange,
-                    max_depth=args.neuron_depth_limit,
-                )
-                print_info_message("ZephIR conversion complete; skipping experimental intensity extraction.")
-                print_info_message("ZephIR export finished. Stopping pipeline as requested.")
-                sys.exit(0)
-            else:
-                ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
-                ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
-                    ref_coords,
-                    ex_vol_folders,
-                    ref_vol_paths,
-                    args.output_dir,
-                    mode=args.processing_mode,
-                    device=device,
-                    shiftrange=shiftrange,
-                    zrange=config_zrange,
-                    align_method=args.align_method,
-                )
-                print_info_message("Processing finished.")
+        if args.transfer_zephir_path:
+            export_volumes_to_zephir(
+                args.ref_volumes_dir,
+                ref_coords_path,
+                args.transfer_zephir_path,
+                z_ratio=config_zratio,
+                zrange=config_zrange,
+                max_depth=args.neuron_depth_limit,
+            )
+            print_info_message("ZephIR conversion complete; skipping experimental intensity extraction.")
+            print_info_message("ZephIR export finished. Stopping pipeline as requested.")
+            sys.exit(0)
+        else:
+            ref_vol_paths = sorted(glob(os.path.join(args.ref_volumes_dir, "*.npy")))
+            ex_neuron_pt_tuple, all_intensities_df = interpolate_and_extract(
+                ref_coords,
+                ex_vol_folders,
+                ref_vol_paths,
+                args.output_dir,
+                mode=args.processing_mode,
+                device=device,
+                zrange=config_zrange,
+                align_method=args.align_method,
+                z_ratio=config_zratio,
+                shiftrange=shiftrange,
+            )
+            print_info_message("Processing finished.")
 
     print_info_message("--- Phase 3: Generating experimental volume video ---")
 
