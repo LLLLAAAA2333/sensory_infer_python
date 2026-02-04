@@ -225,95 +225,73 @@ def translation_matching_fft(volume1, volume2, shiftrange=(61, 61)):
     return (min_distance_index[0]-shiftrange[0]//2, min_distance_index[1]-shiftrange[1]//2)
 
 
-# ----------------------------- 3D Alignment (XY + Z) ----------------------------- #
-
-def get_xz_projection(volume_gpu, z_ratio=1.0):
+def preprocess_for_alignment_optimized(vol_gpu, z_ratio=1.0, percentile=0.98, get_xz=False):
     """
-    Compute XZ MIP projection and resize Z axis to match pixel isotropy.
-    Args:
-        volume_gpu: (Y, X, Z) tensor
-        z_ratio: float, ratio of Z unit / XY unit (typically ~5.0)
+    Fast preprocessing for alignment using MIP + Top Percentile.
     Returns:
-        xz_img: (Z_new, X) int tensor suitable for alignment
+        mask_xy: (Y, X) int tensor
+        mask_xz: (Z_new, X) int tensor or None
     """
-    # 1. MIP along Y axis -> (X, Z)
-    # volume is (Y, X, Z). dim=0 is Y.
-    # values shape: (X, Z)
-    mip_xz = torch.max(volume_gpu, dim=0).values 
+    # 1. XY MIP (standard)
+    # vol_gpu: (Y, X, Z)
+    img_xy = torch.max(vol_gpu, dim=-1).values
     
-    # 2. Transpose to (Z, X) -> treating Z as "Height" (rows), X as "Width" (cols)
-    mip_xz = mip_xz.permute(1, 0) # (Z, X)
-    
-    # 3. Resize Z axis
-    # interpolate expects (N, C, H, W)
-    input_tensor = mip_xz.unsqueeze(0).unsqueeze(0).float() # (1, 1, Z, X)
-    
-    new_h = int(input_tensor.shape[2] * z_ratio)
-    new_w = int(input_tensor.shape[3])
-    
-    # Bilinear interpolation for smoothness
-    resized = F.interpolate(input_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
-    
-    # Back to (Z', X)
-    resized_img = resized.squeeze(0).squeeze(0) # (Z', X)
-    
-    # 4. Thresholding
-    # Treat as volume (Z', X, 1) for pixel_threshold
-    vol_fake = resized_img.unsqueeze(-1)
-    
-    # Dynamic maxpool_k to prevent "Output size is too small" error
-    h, w = resized_img.shape
-    safe_maxpool_k = max(1, min(125, h // 2, w // 2))
+    # 2. XZ MIP (if requested)
+    mask_xz = None
+    if get_xz:
+        # MIP along Y (dim 0) -> (X, Z) -> (Z, X)
+        mip_xz = torch.max(vol_gpu, dim=0).values.permute(1, 0)
+        
+        # Resize Z
+        input_tensor = mip_xz.unsqueeze(0).unsqueeze(0).float()
+        new_h = int(input_tensor.shape[2] * z_ratio)
+        resized = F.interpolate(input_tensor, size=(new_h, int(input_tensor.shape[3])), 
+                              mode='bilinear', align_corners=False)
+        img_xz = resized.squeeze()
+        
+        val_xz = torch.quantile(img_xz.float(), percentile)
+        mask_xz = (img_xz > val_xz).to(torch.int)
 
-    # pixel_threshold handles normalization and background removal
-    mask = pixel_threshold(vol_fake, maxpool_k=safe_maxpool_k) # (Z', X, 1)
-    
-    # Convert to standard image format for matching
-    img = get_image4processing(mask).to(torch.int) # (Z', X)
-    
-    return img
+    # 3. Simple Percentile Thresholding for XY
+    val_xy = torch.quantile(img_xy.float(), percentile)
+    mask_xy = (img_xy > val_xy).to(torch.int)
+
+    return mask_xy, mask_xz
 
 def compute_3d_shift(ref_vol_gpu, ex_vol_gpu, matching_func, shiftrange=(21, 21), z_ratio=1.0, device='cuda'):
     """
-    Compute 3D shift (dx, dy, dz) using dual XY and XZ projections.
+    Compute 3D shift (dx, dy, dz) using optimized dual XY and XZ projections.
     Args:
+        shiftrange: (dy, dx) or (dy, dx, dz)
         matching_func: function with signature (img1, img2, shiftrange, device) -> ((dy, dx), dist)
     Returns:
         shift_xyz: np.array([dx, dy, dz])
-        min_dist: float (combined or avg distance)
+        min_dist: float
     """
-    # 1. XY Alignment
-    ref_mask = pixel_threshold(ref_vol_gpu)
-    ex_mask = pixel_threshold(ex_vol_gpu)
+    use_z = len(shiftrange) == 3
     
-    ref_xy = get_image4processing(ref_mask).to(torch.int)
-    ex_xy = get_image4processing(ex_mask).to(torch.int)
+    # 1. Preprocess Projections
+    ref_xy, ref_xz = preprocess_for_alignment_optimized(ref_vol_gpu, z_ratio, get_xz=use_z)
+    ex_xy, ex_xz = preprocess_for_alignment_optimized(ex_vol_gpu, z_ratio, get_xz=use_z)
     
-    shift_yx, dist_xy = matching_func(ref_xy, ex_xy, shiftrange, device)
+    # 2. XY Alignment
+    # Use only first two dims of shiftrange
+    sr_xy = (shiftrange[0], shiftrange[1])
+    shift_yx, dist_xy = matching_func(ref_xy, ex_xy, sr_xy, device)
     
-    # 2. XZ Alignment
-    ref_xz = get_xz_projection(ref_vol_gpu, z_ratio)
-    ex_xz = get_xz_projection(ex_vol_gpu, z_ratio)
-    
-    # Note: Z is scaled by z_ratio, so pixel shift in Z is magnified.
-    # We use the same shiftrange for simplicity, assuming Z shift isn't massive in *pixels* after scaling?
-    # Actually if Z shift is massive, we might need larger range. 
-    # But usually sample drift is small.
-    shift_zx, dist_zx = matching_func(ref_xz, ex_xz, shiftrange, device)
-    
-    # shift_yx = (row_shift, col_shift) -> (y, x)
     dy = shift_yx[0]
     dx = shift_yx[1]
+    dz_scaled = 0.0
     
-    # shift_zx = (row_shift, col_shift) -> (z_scaled, x)
-    # We take Z from here.
-    dz_scaled = shift_zx[0]
-    
-    # Return scaled Z shift to match coordinate system (Z * z_ratio)
-    # Rescale Z back to original units -> dz = dz_scaled / z_ratio
-    # But pipeline expects scaled shift for coords.
+    # 3. XZ Alignment (Optional)
+    if use_z:
+        # Scale Z-radius (shiftrange[2]) by z_ratio
+        # shiftrange for XZ image (H=Z_new, W=X) is (dz_scaled, dx)
+        sr_xz = (int(shiftrange[2] * z_ratio), shiftrange[1])
+        shift_zx, dist_zx = matching_func(ref_xz, ex_xz, sr_xz, device)
+        dz_scaled = shift_zx[0]
     
     # Combine
     shift_xyz = np.array([dx, dy, dz_scaled])
     
-    return shift_xyz, dist_xy # Return XY dist as primary metric, or average?
+    return shift_xyz, dist_xy
