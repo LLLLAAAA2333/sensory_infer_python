@@ -261,8 +261,12 @@ def get_xz_projection(volume_gpu, z_ratio=1.0):
     # Treat as volume (Z', X, 1) for pixel_threshold
     vol_fake = resized_img.unsqueeze(-1)
     
+    # Dynamic maxpool_k to prevent "Output size is too small" error
+    h, w = resized_img.shape
+    safe_maxpool_k = max(1, min(125, h // 2, w // 2))
+
     # pixel_threshold handles normalization and background removal
-    mask = pixel_threshold(vol_fake) # (Z', X, 1)
+    mask = pixel_threshold(vol_fake, maxpool_k=safe_maxpool_k) # (Z', X, 1)
     
     # Convert to standard image format for matching
     img = get_image4processing(mask).to(torch.int) # (Z', X)
