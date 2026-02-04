@@ -723,7 +723,7 @@ if __name__ == '__main__':
     parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate', 'mip'], 
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
-                        help="Local search range (Rows,Cols) for 'align' or 'dual_propagate' mode, e.g., '21,21' for +/- 10 pixels.")
+                        help="Local search range (Rows,Cols) or (Rows,Cols,Slices) for 'align' or 'dual_propagate' mode, e.g., '21,21' or '21,21,11'.")
     parser.add_argument('--align-method', type=str, choices=['bruteforce', 'fft'], default='bruteforce',
                         help="Method for alignment: 'bruteforce' (exhaustive search) or 'fft' (fast fourier transform).")
 
@@ -749,7 +749,7 @@ if __name__ == '__main__':
 
     try:
         shiftrange = tuple(map(int, args.align_shiftrange.split(',')))
-        if len(shiftrange) != 2: raise ValueError
+        if len(shiftrange) not in (2, 3): raise ValueError
     except ValueError:
         print_warning_message(f"Invalid shiftrange '{args.align_shiftrange}'. Using default (21,21).")
         shiftrange = (21, 21)
@@ -841,6 +841,7 @@ if __name__ == '__main__':
                 zrange=config_zrange,
                 align_method=args.align_method,
                 z_ratio=config_zratio,
+                shiftrange=shiftrange,
             )
             print_info_message("Processing finished.")
 
