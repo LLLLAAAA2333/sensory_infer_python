@@ -16,7 +16,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 
 from src.infer_sequence import run_inference_on_volume_sequence
 from src.infer_single import run_inference_on_single_volume
-from src.inference.volume_alignment import compute_distance, volume_alignment, compute_distance_fft, compute_3d_shift
+from src.inference.volume_alignment import translate_matrix, volume_alignment, compute_distance_fft, compute_3d_shift
 from src.inference.blur import get_image4processing, pixel_threshold
 from src.inference.intensity_extract import extract_neuron_intensities_torch
 from src.merge_resize_inference import Treeformer_End2End
@@ -95,35 +95,6 @@ def load_datapath(folder_path):
     file_paths.sort(key=natural_sort_key)
     return file_paths
 
-def preprocess_for_alignment(volume_gpu):
-    binary_volume_mask = pixel_threshold(volume_gpu)
-    binary_image = get_image4processing(binary_volume_mask).to(torch.int)
-    return binary_image
-
-def translation_matching_bruteforce_with_dist(binary_image1, binary_image2, shiftrange=(21.21), device='cuda'):
-    """
-    Args:
-        (Y, X, Z) format GPU Tensors.
-        Return (row_shift, col_shift) and min_distance.
-    """
-    t1 = time.time() # Start timing here since preprocessing is done outside
-
-    if binary_image1.shape != binary_image2.shape:
-        print_warning_message(f"MIP shape mismatch {binary_image1.shape} vs {binary_image2.shape}. Skipping alignment.")
-        return (0, 0), 99999999.0
-
-    rows, cols = binary_image2.shape
-    distance_matrix = compute_distance(binary_image1, binary_image2, rows, cols, shiftrange)
-    t2 = time.time()
-    
-    min_distance, min_idx = torch.min(distance_matrix.view(-1), 0)
-    min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
-
-    shift_yx = (min_distance_index[0] - shiftrange[0] // 2, min_distance_index[1] - shiftrange[1] // 2)
-    t3 = time.time()
-    
-    # print_log_message(f"[BruteForce] Dist: {t2-t1:.4f}s, Post: {t3-t2:.4f}s")
-    return shift_yx, min_distance.item()
 
 def translation_matching_fft_with_dist(binary_image1, binary_image2, shiftrange=(21, 21), device='cuda'):
     """
@@ -167,7 +138,7 @@ def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
     return cache[path]
 
 def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_dir,
-                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None, align_method='bruteforce', z_ratio=1.0):
+                            mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None, align_preproc='dog', z_ratio=1.0):
     """
     Args:
         ref_coords: numpy array of shape (T_ref, N_neurons, F_features)
@@ -175,12 +146,13 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
         output_dir: directory to save outputs
         mode: 'interpolate', 'align', or 'dual_propagate'
         shiftrange: tuple for bruteforce mode and align mode
-        align_method: 'bruteforce' or 'fft'
+        align_preproc: 'dog' (Difference of Gaussians) or 'afp' (Automatic Foreground Process)
     """
     T_ref, N_neurons, F_features = ref_coords.shape
     print_log_message(f"Loaded reference matrix: {T_ref} ref volumes, {N_neurons} unique neurons, {F_features} features.")
     print_info_message(f"Running in mode: '{mode}'")
-    matching_func = translation_matching_fft_with_dist if align_method == 'fft' else translation_matching_bruteforce_with_dist
+    matching_func = translation_matching_fft_with_dist
+    preproc_method = 'dog' if align_preproc == 'dog' else 'threshold'
 
     if len(ex_vol_folders) != T_ref - 1:
         print_warning_message(f"Mismatch! Found {T_ref} ref volumes but {len(ex_vol_folders)} experimental volume folders. Expected {T_ref - 1} folders.")
@@ -243,7 +215,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             print_log_message(f"  Aligning ref_A to ex_vol_0...")
             vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device, zrange=zrange)
             
-            shift_xyz, dist = compute_3d_shift(ref_A_vol_gpu, vol_k_minus_1_gpu, matching_func, shiftrange, z_ratio, device)
+            shift_xyz, dist = compute_3d_shift(ref_A_vol_gpu, vol_k_minus_1_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
             current_f_coords = ref_start_coords.copy()
             # shift_xyz is [dx, dy, dz]. Coords are [x, y, z].
             shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_f_coords.dtype)
@@ -255,7 +227,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             for k in range(1, num_ex_vols):
                 vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
 
-                shift_xyz, dist = compute_3d_shift(vol_k_minus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device)
+                shift_xyz, dist = compute_3d_shift(vol_k_minus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
                 shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_f_coords.dtype)
                 current_f_coords[:, :3] -= shift_vector
                 forward_coords[k] = current_f_coords.copy()
@@ -267,7 +239,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             vol_k_plus_1_gpu = load_ex_vol_gpu(ex_files[-1], {}, device, zrange=zrange)
             # vol_k_plus_1 matched against ref_B
             # matching_func(ref_B, vol_k_plus_1) -> shift of vol_k_plus_1 relative to ref_B
-            shift_xyz, dist = compute_3d_shift(ref_B_vol_gpu, vol_k_plus_1_gpu, matching_func, shiftrange, z_ratio, device)
+            shift_xyz, dist = compute_3d_shift(ref_B_vol_gpu, vol_k_plus_1_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
 
             current_b_coords = ref_end_coords.copy()
             shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_b_coords.dtype)
@@ -278,7 +250,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             for k in range(num_ex_vols - 2, -1, -1):
                 vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
                 # Align vol_k against vol_k_plus_1
-                shift_xyz, dist = compute_3d_shift(vol_k_plus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device)
+                shift_xyz, dist = compute_3d_shift(vol_k_plus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
                 shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_b_coords.dtype)
                 current_b_coords[:, :3] -= shift_vector
                 backward_coords[k] = current_b_coords.copy()
@@ -327,8 +299,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                 
                 t_start_align = time.time()
                 # align with ref volumes (3D)
-                shift_A_xyz, dist_A = compute_3d_shift(ref_A_vol_gpu, ex_vol_k_gpu, matching_func, shiftrange, z_ratio, device)
-                shift_B_xyz, dist_B = compute_3d_shift(ref_B_vol_gpu, ex_vol_k_gpu, matching_func, shiftrange, z_ratio, device)
+                shift_A_xyz, dist_A = compute_3d_shift(ref_A_vol_gpu, ex_vol_k_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
+                shift_B_xyz, dist_B = compute_3d_shift(ref_B_vol_gpu, ex_vol_k_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
                 t_end_align = time.time()
                 print_log_message(f"Alignment (align mode) for frame {k} took {t_end_align - t_start_align:.4f}s")
                 coords_A = ref_start_coords.copy()
@@ -514,7 +486,8 @@ def run_mip_inference_and_extract(
     os.makedirs(synthetic_volume_save_path, exist_ok=True)
 
     shiftrange = kwargs.get('shiftrange', (101, 101))
-    align_method = kwargs.get('align_method', 'bruteforce')
+    align_preproc = kwargs.get('align_preproc', 'dog')
+    preproc_method = 'dog' if align_preproc == 'dog' else 'threshold'
     aligned_path = os.path.join(synthetic_volume_save_path, 'aligned_volumes_mip.npy')
     shift_path = os.path.join(synthetic_volume_save_path, 'shift_list.npy')
     neuron_tuple_path = os.path.join(synthetic_volume_save_path, 'neuron_pt_tuple.npy')
@@ -534,7 +507,7 @@ def run_mip_inference_and_extract(
             synthetic_volume_save_path,
             shiftrange=shiftrange,
             zrange=zrange,
-            align_method=align_method,
+            method=preproc_method,
         )
         np.save(aligned_path, aligned_volumes_mip)
         np.save(shift_path, shift_list)
@@ -820,8 +793,8 @@ if __name__ == '__main__':
                         default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
                         help="Local search range (Rows,Cols) or (Rows,Cols,Slices) for 'align' or 'dual_propagate' mode, e.g., '21,21' or '21,21,11'.")
-    parser.add_argument('--align-method', type=str, choices=['bruteforce', 'fft'], default='bruteforce',
-                        help="Method for alignment: 'bruteforce' (exhaustive search) or 'fft' (fast fourier transform).")
+    parser.add_argument('--align-preproc', type=str, choices=['dog', 'afp'], default='dog',
+                        help="Preprocessing method for alignment: 'dog' (Difference of Gaussians) or 'afp' (Automatic Foreground Process).")
     
     parser.add_argument('--only-extract-intensity', action='store_true', help="Skip alignment and reuse existing ex_neuron_pt_tuple.npy for intensity extraction.")
 
@@ -871,7 +844,7 @@ if __name__ == '__main__':
             pre_resize_size=args.pre_resize_size,
             pre_rescale_pixels=args.pre_rescale_pixels,
             shiftrange=shiftrange,
-            align_method=args.align_method
+            align_preproc=args.align_preproc
         )
         print_info_message("MIP mode processing finished.")
         
@@ -954,9 +927,9 @@ if __name__ == '__main__':
                 mode=args.processing_mode,
                 device=device,
                 zrange=config_zrange,
-                align_method=args.align_method,
                 z_ratio=config_zratio,
                 shiftrange=shiftrange,
+                align_preproc=args.align_preproc,
             )
             print_info_message("Processing finished.")
 

@@ -6,69 +6,69 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import cv2
-from typing import Tuple
+import math
+from typing import Tuple, Optional
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__))))
 from src.inference.blur import pixel_threshold, get_image4processing
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
 
 
+def get_gaussian_kernel_2d(sigma: float, device: str = 'cuda') -> torch.Tensor:
+    """
+    Dynamically generates a 2D Gaussian convolution kernel.
+    """
+    kernel_size = int(2 * math.ceil(3 * sigma) + 1)
+    # Create 1D Gaussian
+    k1d = torch.arange(kernel_size, device=device).float() - (kernel_size - 1) / 2
+    k1d = torch.exp(-k1d**2 / (2 * sigma**2))
+    k1d = k1d / k1d.sum()
+    
+    # Outer product for 2D
+    kernel = k1d.view(-1, 1) @ k1d.view(1, -1)
+    return kernel.view(1, 1, kernel_size, kernel_size)
+
+
+def apply_dog_filter(img_2d: torch.Tensor, sigma_fg: float = 1.0, sigma_bg: float = 6.0) -> torch.Tensor:
+    """
+    Applies Difference of Gaussians (DoG) filter to 2D image.
+    Formula: dog = blur(sigma_fg) - blur(sigma_bg)
+    Threshold: dog = ReLU(dog), then values < 0.05 * max are set to 0.
+    
+    Uses reflection padding to avoid boundary artifacts.
+    """
+    device = img_2d.device
+    # Ensure input is 4D [B, C, H, W]
+    if img_2d.dim() == 2:
+        input_tensor = img_2d.unsqueeze(0).unsqueeze(0).float()
+    else:
+        input_tensor = img_2d.float()
+
+    k_fg = get_gaussian_kernel_2d(sigma_fg, device)
+    k_bg = get_gaussian_kernel_2d(sigma_bg, device)
+
+    # Calculate padding sizes
+    p_fg = k_fg.shape[-1] // 2
+    p_bg = k_bg.shape[-1] // 2
+
+    # Apply blurs with reflection padding
+    # Format for F.pad: (left, right, top, bottom)
+    blur_fg = F.conv2d(F.pad(input_tensor, (p_fg, p_fg, p_fg, p_fg), mode='reflect'), k_fg, padding=0)
+    blur_bg = F.conv2d(F.pad(input_tensor, (p_bg, p_bg, p_bg, p_bg), mode='reflect'), k_bg, padding=0)
+
+    dog = blur_fg - blur_bg
+    dog = F.relu(dog)
+    
+    # Adaptive soft threshold
+    dog_max = dog.max()
+    if dog_max > 0:
+        mask = dog >= (0.05 * dog_max)
+        dog = dog * mask.float()
+    
+    return dog.squeeze()
+
+
 # ----------------------------- Old methods for volume alignment(Exhaustive) ----------------------------- #
-def pixel2binary(image, rate=0.98):
-    index = round(torch.numel(image) * rate)
-    threshold = torch.mean(torch.sort(image.view(-1))[0][index:].float())
-    binary_image = image > threshold
-    return binary_image.int()
-
-def Euclidean_distance(image1, image2):
-    return torch.sum((image1 - image2) ** 2)
-
-@torch.jit.script
-def compute_distance(binary_image1: torch.Tensor, binary_image2: torch.Tensor, rows: int, cols: int, shiftrange: Tuple[int, int]=(61, 61)):
-    """
-    Each entry in distance_matrix represents the euclidean distance between image 1 and image 2 which moved (i-nrow/2, j-ncol/2)
-    """
-    sr0 = int(shiftrange[0])
-    sr1 = int(shiftrange[1])
-    distance_matrix = torch.zeros(sr0, sr1, device='cuda')
-
-    for i_idx, i in enumerate(range(-sr0//2+1, sr0//2+1)):
-        for j_idx, j in enumerate(range(-sr1//2+1, sr1//2+1)):
-            aligned_image2 = torch.roll(binary_image2, shifts=i, dims=0)
-            aligned_image2 = torch.roll(aligned_image2, shifts=j, dims=1)
-
-            distance = torch.sum((binary_image1 - aligned_image2) ** 2)
-            distance_matrix[i_idx, j_idx] = distance
-
-    return distance_matrix
-
-def translation_matching(volume1, volume2, shiftrange=(61, 61)):
-    """
-    Compute the intersection of image 1 and shifted image 2 
-    return the proper row shift and column shift
-    """
-    if volume1.shape != volume2.shape:
-        raise ValueError("Images must have the same shape")
-
-    # binary_image1 = pixel2binary(image1)
-    # binary_image2 = pixel2binary(image2)
-    binary_volume1 = pixel_threshold(volume1)
-    binary_volume2 = pixel_threshold(volume2)
-    binary_image1 = get_image4processing(binary_volume1).to(torch.int)
-    binary_image2 = get_image4processing(binary_volume2).to(torch.int)
-
-    rows, cols = binary_image2.shape
-
-    # if Euclidean_distance(binary_image1, binary_image2) < torch.sum(binary_image1):
-    #     print(f"Minimum Distance: {Euclidean_distance(binary_image1, binary_image2).item()}, Translation Offset: {(0, 0)}")
-    #     return (0, 0) 
-
-    distance_matrix = compute_distance(binary_image1, binary_image2, rows, cols, shiftrange)
-    min_distance, min_idx = torch.min(distance_matrix.view(-1), 0)
-    min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
-    # print(f"Minimum Distance: {min_distance.item()}, Translation Offset: {(min_distance_index[0]-shiftrange[0]//2, min_distance_index[1]-shiftrange[1]//2)}")
-
-    return (min_distance_index[0]-shiftrange[0]//2, min_distance_index[1]-shiftrange[1]//2)
-
+# ----------------------------- Old methods for volume alignment(Exhaustive) ----------------------------- #
 def translate_matrix(image, row_shift, col_shift):
     """
     Move the image according to the row shift and column shift using PyTorch
@@ -91,7 +91,7 @@ def _apply_zrange(volume_np, zrange=None):
     return volume_np[:, :, z_start:z_end]
 
 
-def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None, align_method='bruteforce'):
+def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None, method='dog'):
     """
     Align volumes, return the synthetic volume and shift pixels of each volume comparing to the initial volume
     """
@@ -108,10 +108,7 @@ def volume_alignment(file_list, save_path, shiftrange=(51, 51), zrange=None, ali
         volume = torch.from_numpy(volume).cuda()
         # image = get_image4processing(volume)
 
-        if align_method == 'fft':
-            shift = translation_matching_fft(torch.from_numpy(reference_volume).cuda(), volume, shiftrange)
-        else:
-            shift = translation_matching(torch.from_numpy(reference_volume).cuda(), volume, shiftrange)
+        shift = translation_matching_fft(torch.from_numpy(reference_volume).cuda(), volume, shiftrange, method=method)
         shift_list.append(shift)
         
         if index % 20 == 0:
@@ -203,7 +200,7 @@ def compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange=(6
 
     return distance_matrix
 
-def translation_matching_fft(volume1, volume2, shiftrange=(61, 61)):
+def translation_matching_fft(volume1, volume2, shiftrange=(61, 61), method='dog'):
     """
     Compute the intersection of image 1 and shifted image 2 using FFT
     return the proper row shift and column shift
@@ -211,54 +208,60 @@ def translation_matching_fft(volume1, volume2, shiftrange=(61, 61)):
     if volume1.shape != volume2.shape:
         raise ValueError("Images must have the same shape")
 
-    binary_volume1 = pixel_threshold(volume1)
-    binary_volume2 = pixel_threshold(volume2)
-    binary_image1 = get_image4processing(binary_volume1).to(torch.int)
-    binary_image2 = get_image4processing(binary_volume2).to(torch.int)
+    # Use DoG-based or traditional thresholding preprocessing
+    mask1, _ = preprocess_for_alignment(volume1, method=method)
+    mask2, _ = preprocess_for_alignment(volume2, method=method)
 
-    rows, cols = binary_image2.shape
+    rows, cols = mask2.shape
 
-    distance_matrix = compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange)
+    distance_matrix = compute_distance_fft(mask1, mask2, rows, cols, shiftrange)
     min_distance, min_idx = torch.min(distance_matrix.reshape(-1), 0)
     min_distance_index = np.unravel_index(min_idx.cpu().numpy(), distance_matrix.shape)
 
     return (min_distance_index[0]-shiftrange[0]//2, min_distance_index[1]-shiftrange[1]//2)
 
 
-def preprocess_for_alignment_optimized(vol_gpu, z_ratio=1.0, percentile=0.98, get_xz=False):
+def preprocess_for_alignment(vol_gpu, z_ratio=1.0, sigma_fg=1.0, sigma_bg=6.0, get_xz=False, method='dog', percentile=0.98):
     """
-    Fast preprocessing for alignment using MIP + Top Percentile.
-    Returns:
-        mask_xy: (Y, X) int tensor
-        mask_xz: (Z_new, X) int tensor or None
+    Fast preprocessing for alignment using MIP + Filter (DoG or PixelThreshold).
+    Returns processed float32 tensors.
     """
-    # 1. XY MIP (standard)
-    # vol_gpu: (Y, X, Z)
-    img_xy = torch.max(vol_gpu, dim=-1).values
-    
-    # 2. XZ MIP (if requested)
-    mask_xz = None
-    if get_xz:
-        # MIP along Y (dim 0) -> (X, Z) -> (Z, X)
-        mip_xz = torch.max(vol_gpu, dim=0).values.permute(1, 0)
+    if method == 'dog':
+        # 1. XY MIP
+        img_xy = torch.max(vol_gpu, dim=-1).values
+        mask_xy = apply_dog_filter(img_xy, sigma_fg, sigma_bg)
         
-        # Resize Z
-        input_tensor = mip_xz.unsqueeze(0).unsqueeze(0).float()
-        new_h = int(input_tensor.shape[2] * z_ratio)
-        resized = F.interpolate(input_tensor, size=(new_h, int(input_tensor.shape[3])), 
-                              mode='bilinear', align_corners=False)
-        img_xz = resized.squeeze()
+        # 2. XZ MIP (if requested)
+        mask_xz = None
+        if get_xz:
+            # MIP along Y (dim 0) -> (X, Z) -> (Z, X)
+            mip_xz = torch.max(vol_gpu, dim=0).values.permute(1, 0)
+            
+            # Resize Z
+            input_tensor = mip_xz.unsqueeze(0).unsqueeze(0).float()
+            new_h = int(input_tensor.shape[2] * z_ratio)
+            resized = F.interpolate(input_tensor, size=(new_h, int(input_tensor.shape[3])), 
+                                mode='bilinear', align_corners=False)
+            img_xz = resized.squeeze()
+            mask_xz = apply_dog_filter(img_xz, sigma_fg, sigma_bg)
+    else:
+        # Traditional PixelThreshold logic (Binary mask converted to float)
+        binary_mask = pixel_threshold(vol_gpu, rescale_p=percentile)
+        mask_xy = get_image4processing(binary_mask).float()
         
-        val_xz = torch.quantile(img_xz.float(), percentile)
-        mask_xz = (img_xz > val_xz).to(torch.int)
-
-    # 3. Simple Percentile Thresholding for XY
-    val_xy = torch.quantile(img_xy.float(), percentile)
-    mask_xy = (img_xy > val_xy).to(torch.int)
+        mask_xz = None
+        if get_xz:
+            # MIP along Y (dim 0) -> (X, Z) -> (Z, X)
+            mask_xz_raw = torch.max(binary_mask, dim=0).values.permute(1, 0)
+            input_tensor = mask_xz_raw.unsqueeze(0).unsqueeze(0).float()
+            new_h = int(input_tensor.shape[2] * z_ratio)
+            resized = F.interpolate(input_tensor, size=(new_h, int(input_tensor.shape[3])), 
+                                mode='bilinear', align_corners=False)
+            mask_xz = resized.squeeze()
 
     return mask_xy, mask_xz
 
-def compute_3d_shift(ref_vol_gpu, ex_vol_gpu, matching_func, shiftrange=(21, 21), z_ratio=1.0, device='cuda'):
+def compute_3d_shift(ref_vol_gpu, ex_vol_gpu, matching_func, shiftrange=(21, 21), z_ratio=1.0, device='cuda', method='dog'):
     """
     Compute 3D shift (dx, dy, dz) using optimized dual XY and XZ projections.
     Args:
@@ -271,8 +274,8 @@ def compute_3d_shift(ref_vol_gpu, ex_vol_gpu, matching_func, shiftrange=(21, 21)
     use_z = len(shiftrange) == 3
     
     # 1. Preprocess Projections
-    ref_xy, ref_xz = preprocess_for_alignment_optimized(ref_vol_gpu, z_ratio, get_xz=use_z)
-    ex_xy, ex_xz = preprocess_for_alignment_optimized(ex_vol_gpu, z_ratio, get_xz=use_z)
+    ref_xy, ref_xz = preprocess_for_alignment(ref_vol_gpu, z_ratio, get_xz=use_z, method=method)
+    ex_xy, ex_xz = preprocess_for_alignment(ex_vol_gpu, z_ratio, get_xz=use_z, method=method)
     
     # 2. XY Alignment
     # Use only first two dims of shiftrange
