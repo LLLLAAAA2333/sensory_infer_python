@@ -209,6 +209,11 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+# agent memory and state
+MEMORY.md
+memory/
+state/
+
 # debug
 debug/
 # pixi environments
