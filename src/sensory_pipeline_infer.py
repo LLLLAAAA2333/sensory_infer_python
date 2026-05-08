@@ -22,6 +22,7 @@ from src.merge_resize_inference import Treeformer_End2End
 from src.comm_utils.prints import print_info_message, print_log_message, print_warning_message
 from src.zephir import zephir_utils
 import src.plot_result.vis_trajectory as vis
+from src.generate_roi_triview_video import build_roi_video
 
 
 def _compute_z_ratio(config_dict):
@@ -514,74 +515,41 @@ def generate_experiment_volume_video(
     default_bbox_size=(6.0, 6.0, 6.0),
     red_pseudo_color=False,
     zrange=None,
+    padding_xyz=(64, 64, 6),
+    min_size_xyz=(256, 256, 16),
 ):
     """
-    Render a volume video with neuron overlays from experimental volumes.
+    Render a ROI-focused tri-view video with neuron overlays from experimental volumes.
     Args:
         ex_volumes: sequence of np.ndarray (T, Y, X, Z) or list of .npy paths.
         ex_neuron_pt_tuple: np.ndarray (T, N, F) with at least XYZ columns.
         save_dir: output directory for frames/video produced by Plot3DResult.
     """
-    os.makedirs(save_dir, exist_ok=True)
-
     if isinstance(ex_volumes, np.ndarray):
-        total_frames = ex_volumes.shape[0]
-        def load_frame(idx):
-            return ex_volumes[idx]
+        volume_paths = [
+            os.path.join(save_dir, f"_tmp_frame_{i:06d}.npy")
+            for i in range(ex_volumes.shape[0])
+        ]
+        os.makedirs(save_dir, exist_ok=True)
+        for i, path in enumerate(volume_paths):
+            np.save(path, ex_volumes[i])
     else:
-        ex_volume_paths = list(ex_volumes)
-        total_frames = len(ex_volume_paths)
-        def load_frame(idx):
-            volume = np.load(ex_volume_paths[idx])
-            return apply_zrange(volume, zrange)
+        volume_paths = list(ex_volumes)
 
-    ex_neuron_pt_tuple = np.asarray(ex_neuron_pt_tuple)
-    if ex_neuron_pt_tuple.shape[0] != total_frames:
-        raise ValueError(f"Frame mismatch: {total_frames} volumes vs {ex_neuron_pt_tuple.shape[0]} neuron frames.")
-
-    def mip_fetcher(idx):
-        raw_volume = load_frame(idx)
-        if raw_volume.ndim != 3:
-            raise ValueError(f"Volume at index {idx} must be 3-D, got shape {raw_volume.shape}.")
-        volume_zyx = np.transpose(raw_volume, (2, 0, 1))
-        volume_u8 = np.clip(volume_zyx, source_min, source_max)
-        volume_u8 = ((volume_u8 - source_min) / (source_max - source_min) * 255).astype(np.uint8)
-        return vis.get_mip_from_uint8_gray_volume(
-            volume_u8,
-            x_ratio=1.0,
-            y_ratio=1.0,
-            z_ratio=z_ratio,
-            source_min=source_min,
-            source_max=source_max,
-            red_pseudo_color=red_pseudo_color,
-        )
-
-    def neuron_fetcher(idx):
-        frame_pts = np.asarray(ex_neuron_pt_tuple[idx])
-        if frame_pts.ndim != 2 or frame_pts.shape[1] < 3:
-            raise ValueError(f"Neuron data at frame {idx} must be (N, F>=3), got {frame_pts.shape}.")
-        valid_mask = ~np.isnan(frame_pts[:, 0])
-        frame_pts = frame_pts[valid_mask]
-        if frame_pts.size == 0:
-            return np.empty((0, 6), dtype=np.float32), np.empty((0,), dtype=np.int32)
-        bbox = np.zeros((frame_pts.shape[0], 6), dtype=np.float32)
-        bbox[:, :3] = frame_pts[:, :3]
-        if frame_pts.shape[1] >= 6:
-            bbox[:, 3:6] = frame_pts[:, 3:6]
-        else:
-            bbox[:, 3] = default_bbox_size[0]
-            bbox[:, 4] = default_bbox_size[1]
-            bbox[:, 5] = default_bbox_size[2]
-        neuron_ids = np.arange(bbox.shape[0], dtype=np.int32)
-        return bbox, neuron_ids
-
-    vis.Plot3DResult(
-        mip_fetcher,
-        neuron_fetcher,
-        split_number=1,
-        bbox_thickness=1,
-        trace_length=0,
-    ).save_all(save_dir, total_frames, fps)
+    build_roi_video(
+        volume_paths=volume_paths,
+        neuron_pt_tuple=np.asarray(ex_neuron_pt_tuple),
+        output_dir=save_dir,
+        fps=fps,
+        z_ratio=z_ratio,
+        source_min=source_min,
+        source_max=source_max,
+        default_bbox_size=default_bbox_size,
+        red_pseudo_color=red_pseudo_color,
+        zrange=zrange,
+        padding_xyz=padding_xyz,
+        min_size_xyz=min_size_xyz,
+    )
 
 def extract_intensities_only(
     ex_vol_folders,
