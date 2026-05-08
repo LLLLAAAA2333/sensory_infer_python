@@ -107,7 +107,7 @@ def translation_matching_fft_with_dist(binary_image1, binary_image2, shiftrange=
 
     if binary_image1.shape != binary_image2.shape:
         print_warning_message(f"MIP shape mismatch {binary_image1.shape} vs {binary_image2.shape}. Skipping alignment.")
-        return
+        return (0, 0), float('inf')
 
     rows, cols = binary_image2.shape
     distance_matrix = compute_distance_fft(binary_image1, binary_image2, rows, cols, shiftrange)
