@@ -783,8 +783,9 @@ if __name__ == '__main__':
 
     # autofluorescence correction (applies only with --transfer-zephir-path)
     parser.add_argument('--remove-autofluorescence', action='store_true',
-                        help="Before ZephIR export, automatically detect and mask autofluorescence in ref_volumes_dir. "
-                             "Modifies .npy files in-place. A per-frame boundary PNG is saved to reference_inference_results/.")
+                        help="Before reference inference and ZephIR export, automatically detect and mask autofluorescence "
+                             "in ref_volumes_dir. Original .npy files are not modified. A per-frame boundary PNG is saved "
+                             "to reference_inference_results/.")
     parser.add_argument('--af-neuron-percentile-high', type=float, default=98,
                         help="High intensity percentile for neuron core detection (default 98).")
     parser.add_argument('--af-neuron-percentile-low', type=float, default=85,
@@ -885,14 +886,35 @@ if __name__ == '__main__':
             if not args.ref_volumes_dir:
                 raise ValueError("'--ref-volumes-dir' is required for non-mip processing modes.")
 
-            print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
             ref_inference_output_dir = os.path.join(args.output_dir, "reference_inference_results")
             os.makedirs(ref_inference_output_dir, exist_ok=True)
+            ref_vol_source = args.ref_volumes_dir
+
+            if args.transfer_zephir_path and args.remove_autofluorescence:
+                from src.preproc.autofluorescence import create_corrected_copy
+                vis_path = os.path.join(ref_inference_output_dir, "per_frame_boundary.png")
+                corrected_dir = os.path.join(args.output_dir, "af_corrected_ref_volumes")
+                print_info_message("Detecting autofluorescence and creating corrected copy of reference volumes before inference...")
+                print_info_message(f"Original files in '{args.ref_volumes_dir}' will NOT be modified.")
+                ref_vol_source = create_corrected_copy(
+                    args.ref_volumes_dir,
+                    corrected_dir,
+                    method='neuron_boundary',
+                    neuron_percentile_high=args.af_neuron_percentile_high,
+                    neuron_percentile_low=args.af_neuron_percentile_low,
+                    dilation_iters=args.af_dilation_iters,
+                    margin=args.af_margin,
+                    vis_output_path=vis_path,
+                )
+                print_info_message(f"Corrected volumes: {corrected_dir}")
+                print_info_message(f"Boundary visualization: {vis_path}")
+
+            print_info_message("--- Phase 1: Running sequence inference on reference volumes ---")
             if args.skip_inference:
                 print_info_message("Skipping reference inference; expecting existing ref_neuron_pt_tuple_filled.npy.")
             else:
                 run_inference_on_volume_sequence(
-                    volume_dir=args.ref_volumes_dir,
+                    volume_dir=ref_vol_source,
                     config_path=args.config,
                     output_dir=ref_inference_output_dir,
                     json_store_root=os.path.join(ref_inference_output_dir, "buffer_state"),
@@ -919,27 +941,6 @@ if __name__ == '__main__':
             clamp_neuron_depth(ref_coords, args.neuron_depth_limit)
 
         if args.transfer_zephir_path:
-            ref_vol_source = args.ref_volumes_dir
-            if args.remove_autofluorescence:
-                from src.preproc.autofluorescence import create_corrected_copy
-                af_vis_dir = os.path.join(args.output_dir, "reference_inference_results")
-                os.makedirs(af_vis_dir, exist_ok=True)
-                vis_path = os.path.join(af_vis_dir, "per_frame_boundary.png")
-                corrected_dir = os.path.join(args.output_dir, "af_corrected_ref_volumes")
-                print_info_message("Detecting autofluorescence and creating corrected copy of reference volumes...")
-                print_info_message(f"Original files in '{args.ref_volumes_dir}' will NOT be modified.")
-                ref_vol_source = create_corrected_copy(
-                    args.ref_volumes_dir,
-                    corrected_dir,
-                    method='neuron_boundary',
-                    neuron_percentile_high=args.af_neuron_percentile_high,
-                    neuron_percentile_low=args.af_neuron_percentile_low,
-                    dilation_iters=args.af_dilation_iters,
-                    margin=args.af_margin,
-                    vis_output_path=vis_path,
-                )
-                print_info_message(f"Corrected volumes: {corrected_dir}")
-                print_info_message(f"Boundary visualization: {vis_path}")
             export_volumes_to_zephir(
                 ref_vol_source,
                 ref_coords_path,
