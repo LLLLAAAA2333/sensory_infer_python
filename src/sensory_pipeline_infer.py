@@ -122,21 +122,6 @@ def translation_matching_fft_with_dist(binary_image1, binary_image2, shiftrange=
     print_log_message(f"[FFT] Dist: {t2-t1:.4f}s, Post: {t3-t2:.4f}s")
     return shift_yx, min_distance.item()
 
-def load_ex_vol_gpu(path, cache, device='cuda', zrange=None):
-    if path not in cache:
-        vol_data = np.load(path)
-        
-        # Filter out high intensity noise
-        if vol_data.max() >=10000:
-             print_warning_message(f"Found high intensity values (>= 10000) in {os.path.basename(path)}. Clamping to median.")
-             vol_data[vol_data >= 10000] = np.median(vol_data).astype(vol_data.dtype)
-
-        vol_data = apply_zrange(vol_data, zrange)
-        if vol_data.dtype == np.uint16:
-            vol_data = vol_data.astype(np.float32)
-        cache[path] = torch.from_numpy(vol_data).to(device).float()
-    return cache[path]
-
 def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_dir,
                             mode='interpolate', device='cuda', shiftrange=(21, 21), zrange=None, align_preproc='dog', z_ratio=1.0):
     """
@@ -144,7 +129,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
         ref_coords: numpy array of shape (T_ref, N_neurons, F_features)
         ex_vol_folders: list of folders, each containing experimental .npy volumes
         output_dir: directory to save outputs
-        mode: 'interpolate', 'align', or 'dual_propagate'
+        mode: 'interpolate' or 'align'
         shiftrange: tuple for bruteforce mode and align mode
         align_preproc: 'dog' (Difference of Gaussians) or 'afp' (Automatic Foreground Process)
     """
@@ -157,8 +142,8 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
     if len(ex_vol_folders) != T_ref - 1:
         print_warning_message(f"Mismatch! Found {T_ref} ref volumes but {len(ex_vol_folders)} experimental volume folders. Expected {T_ref - 1} folders.")
 
-    if mode in ('align', 'dual_propagate') and len(ref_vol_paths) != T_ref:
-        print_warning_message(f"Align/Propagate mode error: Need {T_ref} ref vol paths, but found {len(ref_vol_paths)}. Falling back to 'interpolate'.")
+    if mode == 'align' and len(ref_vol_paths) != T_ref:
+        print_warning_message(f"Align mode error: Need {T_ref} ref vol paths, but found {len(ref_vol_paths)}. Falling back to 'interpolate'.")
         mode = 'interpolate'
     
     # cache for phasecorr mode
@@ -200,85 +185,12 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             print_warning_message(f"No .npy files found in {ex_vol_folders[t]}. Skipping this folder.")
             continue
         
-        if current_mode == 'align' or current_mode == 'dual_propagate':
+        if current_mode == 'align':
             ref_A_vol_gpu = get_ref_vol_gpu(t)
             ref_B_vol_gpu = get_ref_vol_gpu(t + 1)
             if ref_A_vol_gpu is None or ref_B_vol_gpu is None:
                 print_warning_message(f"Segment {t}: Failed to load ref vols, falling back to 'interpolate'.")
                 current_mode = 'interpolate'
-
-        segment_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
-        if current_mode == 'dual_propagate':
-            print_log_message(f"Running dual propagation for segment {t} ({num_ex_vols} frames)...")
-            t_start_align = time.time()
-
-            print_log_message(f"  Aligning ref_A to ex_vol_0...")
-            vol_k_minus_1_gpu = load_ex_vol_gpu(ex_files[0], {}, device, zrange=zrange)
-            
-            shift_xyz, dist = compute_3d_shift(ref_A_vol_gpu, vol_k_minus_1_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
-            current_f_coords = ref_start_coords.copy()
-            # shift_xyz is [dx, dy, dz]. Coords are [x, y, z].
-            shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_f_coords.dtype)
-            current_f_coords[:, :3] -= shift_vector
-
-            forward_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
-            forward_coords[0] = current_f_coords.copy()
-
-            for k in range(1, num_ex_vols):
-                vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
-
-                shift_xyz, dist = compute_3d_shift(vol_k_minus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
-                shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_f_coords.dtype)
-                current_f_coords[:, :3] -= shift_vector
-                forward_coords[k] = current_f_coords.copy()
-                vol_k_minus_1_gpu = vol_k_gpu
-
-            del vol_k_gpu, vol_k_minus_1_gpu
-
-            print_log_message(f"  Aligning ref_B to ex_vol_{num_ex_vols - 1}...")
-            vol_k_plus_1_gpu = load_ex_vol_gpu(ex_files[-1], {}, device, zrange=zrange)
-            # vol_k_plus_1 matched against ref_B
-            # matching_func(ref_B, vol_k_plus_1) -> shift of vol_k_plus_1 relative to ref_B
-            shift_xyz, dist = compute_3d_shift(ref_B_vol_gpu, vol_k_plus_1_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
-
-            current_b_coords = ref_end_coords.copy()
-            shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_b_coords.dtype)
-            current_b_coords[:, :3] -= shift_vector
-            backward_coords = np.full((num_ex_vols, N_neurons, F_features), np.nan, dtype=np.float32)
-            backward_coords[-1] = current_b_coords.copy()
-
-            for k in range(num_ex_vols - 2, -1, -1):
-                vol_k_gpu = load_ex_vol_gpu(ex_files[k], {}, device, zrange=zrange)
-                # Align vol_k against vol_k_plus_1
-                shift_xyz, dist = compute_3d_shift(vol_k_plus_1_gpu, vol_k_gpu, matching_func, shiftrange, z_ratio, device, method=preproc_method)
-                shift_vector = np.array([shift_xyz[0], shift_xyz[1], shift_xyz[2]], dtype=current_b_coords.dtype)
-                current_b_coords[:, :3] -= shift_vector
-                backward_coords[k] = current_b_coords.copy()
-                vol_k_plus_1_gpu = vol_k_gpu
-            
-            del vol_k_gpu, vol_k_plus_1_gpu
-            torch.cuda.empty_cache()
-
-            print_log_message(f"  Blending forward and backward propagation...")
-            for k in range(num_ex_vols):
-                ratio = k / (num_ex_vols - 1.0) if num_ex_vols > 1 else 0.5
-                # get the mean of forward and backward coords
-                f_coords = forward_coords[k]
-                b_coords = backward_coords[k]
-                f_valid = ~np.isnan(f_coords[:, 0])
-                b_valid = ~np.isnan(b_coords[:, 0])
-                blended_coords = np.full((N_neurons, F_features), np.nan, dtype=np.float32)
-                both_valid = f_valid & b_valid
-                blended_coords[both_valid] = (1.0 - ratio) * f_coords[both_valid] + ratio * b_coords[both_valid]
-                only_f = f_valid & ~b_valid
-                blended_coords[only_f] = f_coords[only_f]
-                only_b = ~f_valid & b_valid
-                blended_coords[only_b] = b_coords[only_b]
-                segment_coords[k] = blended_coords
-            
-            t_end_align = time.time()
-            print_log_message(f"Alignment (dual_propagate) for segment {t} took {t_end_align - t_start_align:.4f}s")
-
 
         for k, ex_file_path in enumerate(ex_files):
             interp_pt_tuple = None
@@ -345,9 +257,6 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
                     interp_pt_tuple[only_B] = coords_B[only_B]
                 if np.isnan(interp_pt_tuple[:, 0]).all():
                     interp_pt_tuple = coords_A if dist_A <= dist_B else coords_B
-
-            elif current_mode == 'dual_propagate':
-                interp_pt_tuple = segment_coords[k]
 
             # handle nan situations
             mask_nan_interp = np.isnan(interp_pt_tuple[:,0])
@@ -806,10 +715,10 @@ if __name__ == '__main__':
                         help="Skip running inference when precomputed results already exist (applies to all modes, including mip).")
     
     # inference processing mode
-    parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'dual_propagate', 'mip'], 
-                        default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear), 'align' (shift to nearest ref_vol), or 'dual_propagate' (forward/backward adjacent align).")
+    parser.add_argument('--processing-mode', type=str, choices=['interpolate', 'align', 'mip'],
+                        default='interpolate', help="Strategy for processing ex_vols: 'interpolate' (linear) or 'align' (shift to nearest ref_vol).")
     parser.add_argument('--align-shiftrange', type=str, default="21,21",
-                        help="Local search range (Rows,Cols) or (Rows,Cols,Slices) for 'align' or 'dual_propagate' mode, e.g., '21,21' or '21,21,11'.")
+                        help="Local search range (Rows,Cols) or (Rows,Cols,Slices) for 'align' mode, e.g., '21,21' or '21,21,11'.")
     parser.add_argument('--align-preproc', type=str, choices=['dog', 'afp'], default='dog',
                         help="Preprocessing method for alignment: 'dog' (Difference of Gaussians) or 'afp' (Automatic Foreground Process).")
     
