@@ -282,6 +282,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
 
         for k, ex_file_path in enumerate(ex_files):
             interp_pt_tuple = None
+            ex_vol_data = None
 
             if current_mode == 'interpolate':
                 interp_ratio = (k + 1.0) / (num_ex_vols + 1.0)
@@ -293,6 +294,7 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             elif current_mode == 'align':
                 ex_vol_k_data = np.load(ex_file_path)
                 ex_vol_k_data = apply_zrange(ex_vol_k_data, zrange)
+                ex_vol_data = ex_vol_k_data
                 if ex_vol_k_data.dtype == np.uint16:
                     ex_vol_k_data = ex_vol_k_data.astype(np.float32)
                 ex_vol_k_gpu = torch.from_numpy(ex_vol_k_data).to(device).float()
@@ -362,8 +364,9 @@ def interpolate_and_extract(ref_coords, ex_vol_folders, ref_vol_paths, output_di
             final_valid_mask = ~np.isnan(interp_pt_tuple[:, 0])
             valid_interp_tuple = interp_pt_tuple[final_valid_mask]
 
-            ex_vol_data = np.load(ex_file_path)
-            ex_vol_data = apply_zrange(ex_vol_data, zrange)
+            if ex_vol_data is None:
+                ex_vol_data = np.load(ex_file_path)
+                ex_vol_data = apply_zrange(ex_vol_data, zrange)
 
             t_start_extract = time.time()
             intensity_values, intensity_indices, _ = extract_neuron_intensities_torch(
